@@ -9,17 +9,20 @@ export interface HttpClientConfig {
   baseURL: string;
   getToken?: () => string | null;
   logger?: FrontendLogger;
+  onUnauthorized?: () => void;
 }
 
 export class HttpClient {
   private readonly baseURL: string;
   private readonly getToken?: () => string | null;
   private readonly logger?: FrontendLogger;
+  private readonly onUnauthorized?: () => void;
 
   constructor(config: HttpClientConfig) {
     this.baseURL = config.baseURL;
     this.getToken = config.getToken;
     this.logger = config.logger;
+    this.onUnauthorized = config.onUnauthorized;
   }
 
   /** JSON request/response */
@@ -77,6 +80,11 @@ export class HttpClient {
           return response;
         }
 
+        if (response.status === 401 && this.onUnauthorized) {
+          this.onUnauthorized?.();
+          throw this.createHttpError(response, 'Session expired');
+        }
+
         throw this.createHttpError(response);
       } catch (error) {
         if (this.isAbortError(error)) {
@@ -84,6 +92,10 @@ export class HttpClient {
         }
 
         if (this.isRetryableHttpError(error) && error.status === 429) {
+          throw error;
+        }
+
+        if (this.isRetryableHttpError(error) && error.status === 401 && this.onUnauthorized) {
           throw error;
         }
 
@@ -115,12 +127,19 @@ export class HttpClient {
       }
     }
 
+    const isFormDataBody = typeof FormData !== 'undefined' && options.body instanceof FormData;
     const headers = new Headers({
-      'Content-Type': 'application/json',
       'X-Requested-With': 'XMLHttpRequest',
     });
 
+    if (!isFormDataBody) {
+      headers.set('Content-Type', 'application/json');
+    }
+
     new Headers(options.headers).forEach((value, key) => {
+      if (isFormDataBody && key.toLowerCase() === 'content-type') {
+        return;
+      }
       headers.set(key, value);
     });
 

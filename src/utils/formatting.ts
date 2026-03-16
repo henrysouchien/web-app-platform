@@ -221,6 +221,13 @@ export function formatBasisPoints(value: number): string {
   return `${getNumberFormatter(0).format(basisPoints)} bp`;
 }
 
+export function formatSharpeRatio(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  const finite = value as number;
+  const normalized = Object.is(finite, -0) ? 0 : finite;
+  return normalized.toFixed(2);
+}
+
 export function roundTo(value: number, decimals = 2): number {
   if (!Number.isFinite(value)) {
     return Number.NaN;

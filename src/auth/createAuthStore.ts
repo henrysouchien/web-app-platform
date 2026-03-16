@@ -12,6 +12,9 @@ export interface AuthStoreConfig<TUser> {
   checkAuthStatus: () => Promise<{ authenticated: boolean; user: unknown }>;
   /** Side effects on sign-in (e.g., logger.setUserId, analytics) */
   onSignIn?: (user: TUser) => void;
+  /** Called when signIn succeeds for a previously unauthenticated user.
+   *  Use to invalidate stale caches from the expired session. */
+  onReauthenticate?: () => void;
   /** Domain cleanup on logout (e.g., logger.clearUserId, registry.clear).
    *  Called from signOut() and handleCrossTabLogout() — NOT from clear().
    *  clear() is raw state reset only. Must be idempotent (safe to call
@@ -69,8 +72,12 @@ export function createAuthStore<TUser>(config: AuthStoreConfig<TUser>): AuthStor
       isInitialized: false,
 
       signIn: (user, token) => {
+        const wasUnauthenticated = !get().isAuthenticated && get().isInitialized;
         config.onSignIn?.(user);
         set({ user, token, isAuthenticated: true, error: null, isInitialized: true });
+        if (wasUnauthenticated) {
+          config.onReauthenticate?.();
+        }
       },
 
       signOut: () => {
@@ -118,7 +125,12 @@ export function createAuthStore<TUser>(config: AuthStoreConfig<TUser>): AuthStor
         if (state.isInitialized) return;
         set({ isLoading: true, error: null });
         try {
-          const response = await config.checkAuthStatus();
+          // Outer safety timeout only. Per-call auth timeouts belong in the caller.
+          const AUTH_TIMEOUT_MS = 35_000;
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Auth check timed out')), AUTH_TIMEOUT_MS)
+          );
+          const response = await Promise.race([config.checkAuthStatus(), timeoutPromise]);
           if (response.authenticated && response.user) {
             const user = config.mapUser(response.user);
             config.onSignIn?.(user);
