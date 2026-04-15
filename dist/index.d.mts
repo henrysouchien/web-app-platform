@@ -648,6 +648,7 @@ declare function formatCompact(value: number, opts?: {
     prefix?: string;
 }): string;
 declare function formatBasisPoints(value: number): string;
+declare function formatSharpeRatio(value: number | null | undefined): string;
 declare function roundTo(value: number, decimals?: number): number;
 
 declare function cn(...inputs: ClassValue[]): string;
@@ -660,11 +661,13 @@ interface HttpClientConfig {
     baseURL: string;
     getToken?: () => string | null;
     logger?: FrontendLogger;
+    onUnauthorized?: () => void;
 }
 declare class HttpClient {
     private readonly baseURL;
     private readonly getToken?;
     private readonly logger?;
+    private readonly onUnauthorized?;
     constructor(config: HttpClientConfig);
     /** JSON request/response */
     request<T>(endpoint: string, options?: RequestInit): Promise<T>;
@@ -703,6 +706,9 @@ interface AuthStoreConfig<TUser> {
     }>;
     /** Side effects on sign-in (e.g., logger.setUserId, analytics) */
     onSignIn?: (user: TUser) => void;
+    /** Called when signIn succeeds for a previously unauthenticated user.
+     *  Use to invalidate stale caches from the expired session. */
+    onReauthenticate?: () => void;
     /** Domain cleanup on logout (e.g., logger.clearUserId, registry.clear).
      *  Called from signOut() and handleCrossTabLogout() — NOT from clear().
      *  clear() is raw state reset only. Must be idempotent (safe to call
@@ -784,4 +790,4 @@ declare function createRuntimeConfigLoader<T>(options: RuntimeConfigLoaderOption
     clearConfigCache: () => void;
 };
 
-export { AdapterRegistry, type AuthState, type AuthStoreConfig, type AuthStoreHook, type CacheAlerts, type CacheCoordinatorLike, CacheDebugger, type CacheEntry, type CacheEntryMetadata, type CacheEvent, type CacheKeyInfo, type CacheKeyMetadata, type CacheMetrics, CacheMonitorBase, type CacheOperationMetrics, type CachePerformanceMetrics, type CachePerformanceReport, type CacheStateReport, type CacheStats, type DebugFilters, type DebugOperation, type DebugSession, ErrorAdapter, type ErrorEnvelope, EventBus, type EventHandler, FrontendLogger, HttpClient, type InvalidationFlowDiagram, type InvalidationStep, type KeyCollision, type LayerPerformance, type LayerState, type LogCategory, type LogLevel, LogoutBroadcaster, QueryProvider, type RetryableHttpError, ServiceContainer, type StandardCacheKey, UnifiedCache, _clearResetFunction, _setResetFunction, broadcastLogout, cn, createAuthProvider, createAuthSelectors, createAuthStore, createRuntimeConfigLoader, frontendLogger as default, formatBasisPoints, formatCompact, formatCurrency, formatNumber, formatPercent, frontendLogger, generateContentHash, generateStandardCacheKey, getQueryClient, initQueryConfig, log, logoutBroadcaster, parseStandardCacheKey, queryClient, resetQueryClient, roundTo, validateCacheKeyMetadata };
+export { AdapterRegistry, type AuthState, type AuthStoreConfig, type AuthStoreHook, type CacheAlerts, type CacheCoordinatorLike, CacheDebugger, type CacheEntry, type CacheEntryMetadata, type CacheEvent, type CacheKeyInfo, type CacheKeyMetadata, type CacheMetrics, CacheMonitorBase, type CacheOperationMetrics, type CachePerformanceMetrics, type CachePerformanceReport, type CacheStateReport, type CacheStats, type DebugFilters, type DebugOperation, type DebugSession, ErrorAdapter, type ErrorEnvelope, EventBus, type EventHandler, FrontendLogger, HttpClient, type InvalidationFlowDiagram, type InvalidationStep, type KeyCollision, type LayerPerformance, type LayerState, type LogCategory, type LogLevel, LogoutBroadcaster, QueryProvider, type RetryableHttpError, ServiceContainer, type StandardCacheKey, UnifiedCache, _clearResetFunction, _setResetFunction, broadcastLogout, cn, createAuthProvider, createAuthSelectors, createAuthStore, createRuntimeConfigLoader, frontendLogger as default, formatBasisPoints, formatCompact, formatCurrency, formatNumber, formatPercent, formatSharpeRatio, frontendLogger, generateContentHash, generateStandardCacheKey, getQueryClient, initQueryConfig, log, logoutBroadcaster, parseStandardCacheKey, queryClient, resetQueryClient, roundTo, validateCacheKeyMetadata };

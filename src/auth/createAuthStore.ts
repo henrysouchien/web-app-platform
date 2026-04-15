@@ -60,6 +60,7 @@ export function createAuthStore<TUser>(config: AuthStoreConfig<TUser>): AuthStor
   let storageHandler: ((e: StorageEvent) => void) | null = null;
   let broadcastCleanup: (() => void) | null = null;
   let isListenerSetup = false;
+  let initializePromise: Promise<void> | null = null;
 
   return createWithEqualityFn<AuthState<TUser>>()(
     devtools((set, get) => ({
@@ -123,34 +124,42 @@ export function createAuthStore<TUser>(config: AuthStoreConfig<TUser>): AuthStor
       initializeAuth: async () => {
         const state = get();
         if (state.isInitialized) return;
-        set({ isLoading: true, error: null });
-        try {
-          // Outer safety timeout only. Per-call auth timeouts belong in the caller.
-          const AUTH_TIMEOUT_MS = 35_000;
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Auth check timed out')), AUTH_TIMEOUT_MS)
-          );
-          const response = await Promise.race([config.checkAuthStatus(), timeoutPromise]);
-          if (response.authenticated && response.user) {
-            const user = config.mapUser(response.user);
-            config.onSignIn?.(user);
-            set({ user, isAuthenticated: true, isInitialized: true, isLoading: false, error: null });
-          } else {
-            // Unauthenticated init — call onUnauthInit for domain cleanup
-            // (e.g., clear stale AdapterRegistry from previous session)
-            config.onUnauthInit?.();
-            set({ user: null, isAuthenticated: false, isInitialized: true, isLoading: false, error: null });
+        if (initializePromise) return initializePromise;
+
+        initializePromise = (async () => {
+          set({ isLoading: true, error: null });
+          try {
+            // Outer safety timeout only. Per-call auth timeouts belong in the caller.
+            const AUTH_TIMEOUT_MS = 35_000;
+            const timeoutPromise = new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('Auth check timed out')), AUTH_TIMEOUT_MS)
+            );
+            const response = await Promise.race([config.checkAuthStatus(), timeoutPromise]);
+            if (response.authenticated && response.user) {
+              const user = config.mapUser(response.user);
+              config.onSignIn?.(user);
+              set({ user, isAuthenticated: true, isInitialized: true, isLoading: false, error: null });
+            } else {
+              // Unauthenticated init — call onUnauthInit for domain cleanup
+              // (e.g., clear stale AdapterRegistry from previous session)
+              config.onUnauthInit?.();
+              set({ user: null, isAuthenticated: false, isInitialized: true, isLoading: false, error: null });
+            }
+          } catch (error) {
+            config.logger?.logError?.('authStore', 'Auth initialization failed', error);
+            set({
+              user: null,
+              isAuthenticated: false,
+              isInitialized: true,
+              isLoading: false,
+              error: error instanceof Error ? error.message : 'Authentication check failed',
+            });
+          } finally {
+            initializePromise = null;
           }
-        } catch (error) {
-          config.logger?.logError?.('authStore', 'Auth initialization failed', error);
-          set({
-            user: null,
-            isAuthenticated: false,
-            isInitialized: true,
-            isLoading: false,
-            error: error instanceof Error ? error.message : 'Authentication check failed',
-          });
-        }
+        })();
+
+        return initializePromise;
       },
 
       setupCrossTabSync: () => {

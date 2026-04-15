@@ -1,359 +1,278 @@
-import type { CacheEvent } from '../events/EventBus';
 import type { EventBus } from '../events/EventBus';
-import { frontendLogger } from '../logging/Logger';
+import type { CacheOperationMetrics } from './types';
 
-export interface CacheMetrics {
-  layer: string;
-  operation: 'hit' | 'miss' | 'set' | 'clear' | 'invalidate';
-  key: string;
-  responseTime: number;
-  dataType?: string;
-  scopeId?: string;
-  timestamp: number;
-  cacheSize?: number;
-  memoryUsage?: number;
-}
+export type CacheMetrics = CacheOperationMetrics;
 
 export interface LayerPerformance {
   layer: string;
-  totalOperations: number;
+  operations: number;
   hits: number;
   misses: number;
-  hitRatio: number;
-  avgResponseTime: number;
-  totalResponseTime: number;
-  cacheSize: number;
-  memoryUsage: number;
-  lastActivity: number;
-}
-
-export interface CachePerformanceReport {
-  reportId: string;
-  generatedAt: number;
-  timeRange: {
-    start: number;
-    end: number;
-    durationMs: number;
-  };
-  layers: LayerPerformance[];
-  summary: {
-    totalOperations: number;
-    overallHitRatio: number;
-    avgResponseTime: number;
-    totalMemoryUsage: number;
-    mostActiveLayer: string;
-    slowestLayer: string;
-    recommendations: string[];
-  };
-  recentOperations: CacheMetrics[];
+  hitRate: number;
+  averageResponseTime: number;
+  slowOperations: number;
 }
 
 export interface CacheAlerts {
-  lowHitRatio: { layer: string; ratio: number; threshold: number }[];
-  slowOperations: { layer: string; avgTime: number; threshold: number }[];
-  highMemoryUsage: { layer: string; usage: number; threshold: number }[];
-  frequentMisses: { key: string; count: number; layer: string }[];
+  slowLayers: string[];
+  hotKeys: string[];
+  highMissRateLayers: string[];
+}
+
+export interface CachePerformanceReport {
+  generatedAt: number;
+  timeRangeMs: number;
+  totalOperations: number;
+  hitRate: number;
+  layers: LayerPerformance[];
+  recentOperations: CacheMetrics[];
+  alerts: CacheAlerts;
+}
+
+export interface CacheMonitorConfig {
+  eventNames?: string[];
+  maxRecentOperations?: number;
+  slowOperationThresholdMs?: number;
+  hotKeyThreshold?: number;
+  highMissRateThreshold?: number;
+}
+
+interface CacheEventLike {
+  type?: string;
+  scopeId?: string;
+  portfolioId?: string;
+  dataType?: string;
+  timestamp?: number;
+  metadata?: Record<string, unknown>;
+}
+
+const CACHE_EVENT_NAMES = [
+  'cache-hit',
+  'cache-miss',
+  'cache-updated',
+  'cache-invalidated',
+  'cache-cleared',
+];
+
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
 }
 
 export class CacheMonitorBase {
-  private metrics: CacheMetrics[] = [];
-  private layerStats = new Map<string, LayerPerformance>();
-  private readonly maxMetricsHistory = 10000;
-  private readonly alertThresholds = {
-    hitRatio: 0.7,
-    responseTime: 1000,
-    memoryUsage: 100 * 1024 * 1024,
-    missFrequency: 10,
-  };
+  private readonly recentOperations: CacheMetrics[] = [];
+  private readonly unsubscribers: Array<() => void> = [];
+  private readonly config: Required<CacheMonitorConfig>;
 
-  constructor(
-    private eventBus: EventBus,
-    private config: { eventNames: string[] },
-  ) {
-    this.setupEventListeners();
-    frontendLogger.adapter.transformSuccess('CacheMonitorBase', 'Initialized with event listeners');
-  }
+  constructor(private readonly eventBus: EventBus, config: CacheMonitorConfig = {}) {
+    this.config = {
+      eventNames: config.eventNames ?? [],
+      maxRecentOperations: config.maxRecentOperations ?? 500,
+      slowOperationThresholdMs: config.slowOperationThresholdMs ?? 150,
+      hotKeyThreshold: config.hotKeyThreshold ?? 5,
+      highMissRateThreshold: config.highMissRateThreshold ?? 0.4,
+    };
 
-  private setupEventListeners(): void {
-    this.eventBus.on<CacheEvent>('cache-updated', event => {
-      const eventKey = typeof event.metadata?.key === 'string' ? event.metadata.key : 'unknown';
-      this.trackCacheOperation({
-        layer: event.source || 'unknown',
-        operation: 'set',
-        key: eventKey,
-        responseTime: 0,
-        dataType: event.dataType,
-        scopeId: event.scopeId,
-        timestamp: event.timestamp || Date.now(),
-      });
-    });
-
-    this.eventBus.on<CacheEvent>('cache-cleared', event => {
-      const metadataPattern = typeof event.metadata?.pattern === 'string' ? event.metadata.pattern : null;
-      const metadataKey = typeof event.metadata?.key === 'string' ? event.metadata.key : null;
-      this.trackCacheOperation({
-        layer: event.source || 'unknown',
-        operation: 'clear',
-        key: metadataPattern || metadataKey || 'bulk-clear',
-        responseTime: 0,
-        dataType: event.dataType,
-        scopeId: event.scopeId,
-        timestamp: event.timestamp || Date.now(),
-      });
-    });
-
-    Array.from(new Set(this.config.eventNames)).forEach(eventName => {
-      this.eventBus.on<CacheEvent>(eventName, event => {
-        this.trackCacheOperation({
-          layer: event.source || 'coordinator',
-          operation: 'invalidate',
-          key: event.scopeId ? `${eventName}-${event.scopeId}` : eventName,
-          responseTime: 0,
-          dataType: event.dataType,
-          scopeId: event.scopeId,
-          timestamp: event.timestamp || Date.now(),
-        });
-      });
-    });
+    this.subscribeToEvents();
   }
 
   trackCacheHit(layer: string, key: string, responseTime: number, dataType?: string, scopeId?: string): void {
-    this.trackCacheOperation({
+    this.recordMetric({
       layer,
-      operation: 'hit',
       key,
-      responseTime,
-      dataType,
-      scopeId,
+      operation: 'hit',
+      durationMs: responseTime,
       timestamp: Date.now(),
+      scopeId,
+      dataType,
+      success: true,
     });
   }
 
   trackCacheMiss(layer: string, key: string, fetchTime: number, dataType?: string, scopeId?: string): void {
-    this.trackCacheOperation({
+    this.recordMetric({
       layer,
-      operation: 'miss',
       key,
-      responseTime: fetchTime,
-      dataType,
-      scopeId,
+      operation: 'miss',
+      durationMs: fetchTime,
       timestamp: Date.now(),
+      scopeId,
+      dataType,
+      success: true,
     });
-  }
-
-  private trackCacheOperation(metric: CacheMetrics): void {
-    this.metrics.push(metric);
-
-    if (this.metrics.length > this.maxMetricsHistory) {
-      this.metrics = this.metrics.slice(-this.maxMetricsHistory);
-    }
-
-    this.updateLayerStats(metric);
-
-    if (metric.operation === 'miss' && metric.responseTime > this.alertThresholds.responseTime) {
-      frontendLogger.adapter.transformError('CacheMonitorBase', new Error('Slow cache miss detected'), {
-        layer: metric.layer,
-        key: metric.key,
-        responseTime: metric.responseTime,
-      });
-    }
-  }
-
-  private updateLayerStats(metric: CacheMetrics): void {
-    const layerKey = metric.layer;
-    let stats = this.layerStats.get(layerKey);
-
-    if (!stats) {
-      stats = {
-        layer: layerKey,
-        totalOperations: 0,
-        hits: 0,
-        misses: 0,
-        hitRatio: 0,
-        avgResponseTime: 0,
-        totalResponseTime: 0,
-        cacheSize: 0,
-        memoryUsage: 0,
-        lastActivity: Date.now(),
-      };
-      this.layerStats.set(layerKey, stats);
-    }
-
-    stats.totalOperations++;
-    stats.lastActivity = metric.timestamp;
-    stats.totalResponseTime += metric.responseTime;
-    stats.avgResponseTime = stats.totalResponseTime / stats.totalOperations;
-
-    if (metric.operation === 'hit') {
-      stats.hits++;
-    } else if (metric.operation === 'miss') {
-      stats.misses++;
-    }
-
-    const totalHitMissOps = stats.hits + stats.misses;
-    if (totalHitMissOps > 0) {
-      stats.hitRatio = stats.hits / totalHitMissOps;
-    }
-
-    if (metric.cacheSize !== undefined) {
-      stats.cacheSize = metric.cacheSize;
-    }
-    if (metric.memoryUsage !== undefined) {
-      stats.memoryUsage = metric.memoryUsage;
-    }
   }
 
   generateReport(timeRangeMs: number = 300000): CachePerformanceReport {
-    const now = Date.now();
-    const startTime = now - timeRangeMs;
-    const recentMetrics = this.metrics.filter(m => m.timestamp >= startTime);
-    const layers = Array.from(this.layerStats.values());
-    const totalOperations = layers.reduce((sum, layer) => sum + layer.totalOperations, 0);
-    const totalHits = layers.reduce((sum, layer) => sum + layer.hits, 0);
-    const totalMisses = layers.reduce((sum, layer) => sum + layer.misses, 0);
-    const overallHitRatio = totalHits + totalMisses > 0 ? totalHits / (totalHits + totalMisses) : 0;
-    const avgResponseTime = layers.length > 0
-      ? layers.reduce((sum, layer) => sum + layer.avgResponseTime, 0) / layers.length
-      : 0;
-    const totalMemoryUsage = layers.reduce((sum, layer) => sum + layer.memoryUsage, 0);
-    const mostActiveLayer = layers.reduce(
-      (max, layer) => (layer.totalOperations > max.totalOperations ? layer : max),
-      layers[0] || { layer: 'none', totalOperations: 0 },
-    );
-    const slowestLayer = layers.reduce(
-      (max, layer) => (layer.avgResponseTime > max.avgResponseTime ? layer : max),
-      layers[0] || { layer: 'none', avgResponseTime: 0 },
-    );
-    const recommendations = this.generateRecommendations(layers);
+    const cutoff = Date.now() - timeRangeMs;
+    const operations = this.recentOperations.filter(operation => operation.timestamp >= cutoff);
+    const layers = this.buildLayerPerformance(operations);
+    const hits = operations.filter(operation => operation.operation === 'hit').length;
+    const misses = operations.filter(operation => operation.operation === 'miss').length;
+    const totalLookups = hits + misses;
 
-    const report: CachePerformanceReport = {
-      reportId: `cache-report-${now}`,
-      generatedAt: now,
-      timeRange: {
-        start: startTime,
-        end: now,
-        durationMs: timeRangeMs,
-      },
+    return {
+      generatedAt: Date.now(),
+      timeRangeMs,
+      totalOperations: operations.length,
+      hitRate: totalLookups > 0 ? hits / totalLookups : 0,
       layers,
-      summary: {
-        totalOperations,
-        overallHitRatio,
-        avgResponseTime,
-        totalMemoryUsage,
-        mostActiveLayer: mostActiveLayer.layer,
-        slowestLayer: slowestLayer.layer,
-        recommendations,
-      },
-      recentOperations: recentMetrics.slice(-50),
+      recentOperations: operations.slice(-100),
+      alerts: this.buildAlerts(operations, layers),
     };
-
-    frontendLogger.adapter.transformSuccess('CacheMonitorBase', {
-      message: 'Performance report generated',
-      reportId: report.reportId,
-      totalOperations,
-      overallHitRatio: Math.round(overallHitRatio * 100),
-      layerCount: layers.length,
-    });
-
-    return report;
-  }
-
-  private generateRecommendations(layers: LayerPerformance[]): string[] {
-    const recommendations: string[] = [];
-
-    layers.forEach(layer => {
-      if (layer.hitRatio < this.alertThresholds.hitRatio) {
-        recommendations.push(`${layer.layer}: Low hit ratio (${Math.round(layer.hitRatio * 100)}%). Consider increasing TTL or cache size.`);
-      }
-
-      if (layer.avgResponseTime > this.alertThresholds.responseTime) {
-        recommendations.push(`${layer.layer}: Slow operations (${Math.round(layer.avgResponseTime)}ms avg). Consider optimizing data access patterns.`);
-      }
-
-      if (layer.memoryUsage > this.alertThresholds.memoryUsage) {
-        recommendations.push(`${layer.layer}: High memory usage (${Math.round(layer.memoryUsage / 1024 / 1024)}MB). Consider implementing cache size limits.`);
-      }
-    });
-
-    if (recommendations.length === 0) {
-      recommendations.push('Cache performance is within acceptable thresholds.');
-    }
-
-    return recommendations;
-  }
-
-  getAlerts(): CacheAlerts {
-    const layers = Array.from(this.layerStats.values());
-
-    return {
-      lowHitRatio: layers
-        .filter(layer => layer.hitRatio < this.alertThresholds.hitRatio)
-        .map(layer => ({
-          layer: layer.layer,
-          ratio: layer.hitRatio,
-          threshold: this.alertThresholds.hitRatio,
-        })),
-      slowOperations: layers
-        .filter(layer => layer.avgResponseTime > this.alertThresholds.responseTime)
-        .map(layer => ({
-          layer: layer.layer,
-          avgTime: layer.avgResponseTime,
-          threshold: this.alertThresholds.responseTime,
-        })),
-      highMemoryUsage: layers
-        .filter(layer => layer.memoryUsage > this.alertThresholds.memoryUsage)
-        .map(layer => ({
-          layer: layer.layer,
-          usage: layer.memoryUsage,
-          threshold: this.alertThresholds.memoryUsage,
-        })),
-      frequentMisses: this.getFrequentMisses(),
-    };
-  }
-
-  private getFrequentMisses(): { key: string; count: number; layer: string }[] {
-    const missCount = new Map<string, { count: number; layer: string }>();
-
-    this.metrics
-      .filter(m => m.operation === 'miss')
-      .forEach(m => {
-        const key = `${m.layer}:${m.key}`;
-        const existing = missCount.get(key);
-        if (existing) {
-          existing.count++;
-        } else {
-          missCount.set(key, { count: 1, layer: m.layer });
-        }
-      });
-
-    return Array.from(missCount.entries())
-      .filter(([_, data]) => data.count >= this.alertThresholds.missFrequency)
-      .map(([key, data]) => ({
-        key: key.split(':')[1],
-        count: data.count,
-        layer: data.layer,
-      }))
-      .sort((a, b) => b.count - a.count);
-  }
-
-  getRealtimeStats(): { layers: LayerPerformance[]; alerts: CacheAlerts } {
-    return {
-      layers: Array.from(this.layerStats.values()),
-      alerts: this.getAlerts(),
-    };
-  }
-
-  clearMetrics(): void {
-    this.metrics = [];
-    this.layerStats.clear();
-    frontendLogger.adapter.transformSuccess('CacheMonitorBase', 'All metrics cleared');
   }
 
   getLayerMetrics(layer: string): CacheMetrics[] {
-    return this.metrics.filter(m => m.layer === layer);
+    return this.recentOperations.filter(operation => operation.layer === layer);
   }
 
   getScopeMetrics(scopeId: string): CacheMetrics[] {
-    return this.metrics.filter(m => m.scopeId === scopeId);
+    return this.recentOperations.filter(operation => operation.scopeId === scopeId);
+  }
+
+  getRecentOperations(limit: number = 100): CacheMetrics[] {
+    return this.recentOperations.slice(-limit);
+  }
+
+  dispose(): void {
+    this.unsubscribers.forEach(unsubscribe => unsubscribe());
+    this.unsubscribers.length = 0;
+  }
+
+  private subscribeToEvents(): void {
+    const subscribedEvents = new Set([...CACHE_EVENT_NAMES, ...this.config.eventNames]);
+
+    subscribedEvents.forEach(eventName => {
+      const unsubscribe = this.eventBus.on<CacheEventLike>(eventName, event => {
+        this.recordMetric(this.metricFromEvent(eventName, event));
+      });
+      this.unsubscribers.push(unsubscribe);
+    });
+  }
+
+  private metricFromEvent(eventName: string, event: CacheEventLike): CacheMetrics {
+    const metadata = toRecord(event.metadata);
+    const scopeId = typeof event.scopeId === 'string'
+      ? event.scopeId
+      : typeof event.portfolioId === 'string'
+        ? event.portfolioId
+        : undefined;
+    const key = typeof metadata.key === 'string'
+      ? metadata.key
+      : `${eventName}:${event.dataType ?? 'unknown'}:${scopeId ?? 'global'}`;
+    const durationMs = typeof metadata.durationMs === 'number' ? metadata.durationMs : 0;
+    const layer = typeof metadata.layer === 'string' ? metadata.layer : this.resolveLayer(eventName);
+
+    return {
+      layer,
+      key,
+      operation: this.resolveOperation(eventName),
+      durationMs,
+      timestamp: typeof event.timestamp === 'number' ? event.timestamp : Date.now(),
+      scopeId,
+      dataType: event.dataType,
+      success: true,
+      metadata,
+    };
+  }
+
+  private resolveLayer(eventName: string): string {
+    if (eventName.startsWith('cache-')) {
+      return 'unified-cache';
+    }
+
+    if (eventName.includes('risk')) {
+      return 'risk-coordinator';
+    }
+
+    if (eventName.includes('portfolio')) {
+      return 'portfolio-coordinator';
+    }
+
+    return 'cache-monitor';
+  }
+
+  private resolveOperation(eventName: string): CacheMetrics['operation'] {
+    if (eventName === 'cache-hit') {
+      return 'hit';
+    }
+
+    if (eventName === 'cache-miss') {
+      return 'miss';
+    }
+
+    if (eventName === 'cache-updated') {
+      return 'set';
+    }
+
+    if (eventName === 'cache-cleared') {
+      return 'clear';
+    }
+
+    return 'invalidate';
+  }
+
+  private recordMetric(metric: CacheMetrics): void {
+    this.recentOperations.push(metric);
+    if (this.recentOperations.length > this.config.maxRecentOperations) {
+      this.recentOperations.splice(0, this.recentOperations.length - this.config.maxRecentOperations);
+    }
+  }
+
+  private buildLayerPerformance(operations: CacheMetrics[]): LayerPerformance[] {
+    const byLayer = new Map<string, CacheMetrics[]>();
+
+    operations.forEach(operation => {
+      const layerOperations = byLayer.get(operation.layer) ?? [];
+      layerOperations.push(operation);
+      byLayer.set(operation.layer, layerOperations);
+    });
+
+    return Array.from(byLayer.entries()).map(([layer, layerOperations]) => {
+      const hits = layerOperations.filter(operation => operation.operation === 'hit').length;
+      const misses = layerOperations.filter(operation => operation.operation === 'miss').length;
+      const totalLookups = hits + misses;
+      const totalDuration = layerOperations.reduce((sum, operation) => sum + operation.durationMs, 0);
+
+      return {
+        layer,
+        operations: layerOperations.length,
+        hits,
+        misses,
+        hitRate: totalLookups > 0 ? hits / totalLookups : 0,
+        averageResponseTime: layerOperations.length > 0 ? totalDuration / layerOperations.length : 0,
+        slowOperations: layerOperations.filter(
+          operation => operation.durationMs >= this.config.slowOperationThresholdMs,
+        ).length,
+      };
+    });
+  }
+
+  private buildAlerts(operations: CacheMetrics[], layers: LayerPerformance[]): CacheAlerts {
+    const keyCounts = new Map<string, number>();
+    const missCounts = new Map<string, { misses: number; totalLookups: number }>();
+
+    operations.forEach(operation => {
+      keyCounts.set(operation.key, (keyCounts.get(operation.key) ?? 0) + 1);
+
+      if (operation.operation === 'hit' || operation.operation === 'miss') {
+        const counts = missCounts.get(operation.layer) ?? { misses: 0, totalLookups: 0 };
+        counts.totalLookups += 1;
+        if (operation.operation === 'miss') {
+          counts.misses += 1;
+        }
+        missCounts.set(operation.layer, counts);
+      }
+    });
+
+    return {
+      slowLayers: layers
+        .filter(layer => layer.slowOperations > 0)
+        .map(layer => layer.layer),
+      hotKeys: Array.from(keyCounts.entries())
+        .filter(([, count]) => count >= this.config.hotKeyThreshold)
+        .map(([key]) => key),
+      highMissRateLayers: Array.from(missCounts.entries())
+        .filter(([, counts]) => counts.totalLookups > 0 && counts.misses / counts.totalLookups >= this.config.highMissRateThreshold)
+        .map(([layer]) => layer),
+    };
   }
 }

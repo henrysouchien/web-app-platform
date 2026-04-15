@@ -2295,6 +2295,12 @@ function formatBasisPoints(value) {
   const basisPoints = roundTo(finite * 1e4, 0);
   return `${getNumberFormatter(0).format(basisPoints)} bp`;
 }
+function formatSharpeRatio(value) {
+  if (value == null || !Number.isFinite(value)) return "\u2014";
+  const finite = value;
+  const normalized = Object.is(finite, -0) ? 0 : finite;
+  return normalized.toFixed(2);
+}
 function roundTo(value, decimals = 2) {
   if (!Number.isFinite(value)) {
     return Number.NaN;
@@ -2315,6 +2321,7 @@ var HttpClient = class {
     this.baseURL = config.baseURL;
     this.getToken = config.getToken;
     this.logger = config.logger;
+    this.onUnauthorized = config.onUnauthorized;
   }
   /** JSON request/response */
   async request(endpoint, options = {}) {
@@ -2360,12 +2367,19 @@ var HttpClient = class {
         if (response.ok) {
           return response;
         }
+        if (response.status === 401 && this.onUnauthorized) {
+          this.onUnauthorized?.();
+          throw this.createHttpError(response, "Session expired");
+        }
         throw this.createHttpError(response);
       } catch (error) {
         if (this.isAbortError(error)) {
           throw error;
         }
         if (this.isRetryableHttpError(error) && error.status === 429) {
+          throw error;
+        }
+        if (this.isRetryableHttpError(error) && error.status === 401 && this.onUnauthorized) {
           throw error;
         }
         if (attempt === retries) {
@@ -2388,11 +2402,17 @@ var HttpClient = class {
         });
       }
     }
+    const isFormDataBody = typeof FormData !== "undefined" && options.body instanceof FormData;
     const headers = new Headers({
-      "Content-Type": "application/json",
       "X-Requested-With": "XMLHttpRequest"
     });
+    if (!isFormDataBody) {
+      headers.set("Content-Type", "application/json");
+    }
     new Headers(options.headers).forEach((value, key) => {
+      if (isFormDataBody && key.toLowerCase() === "content-type") {
+        return;
+      }
       headers.set(key, value);
     });
     const token = this.getToken?.();
@@ -2544,8 +2564,12 @@ function createAuthStore(config) {
       error: null,
       isInitialized: false,
       signIn: (user, token) => {
+        const wasUnauthenticated = !get().isAuthenticated && get().isInitialized;
         config.onSignIn?.(user);
         set({ user, token, isAuthenticated: true, error: null, isInitialized: true });
+        if (wasUnauthenticated) {
+          config.onReauthenticate?.();
+        }
       },
       signOut: () => {
         config.logger?.logAdapter?.("authStore", "signOut");
@@ -2581,7 +2605,11 @@ function createAuthStore(config) {
         if (state.isInitialized) return;
         set({ isLoading: true, error: null });
         try {
-          const response = await config.checkAuthStatus();
+          const AUTH_TIMEOUT_MS = 35e3;
+          const timeoutPromise = new Promise(
+            (_, reject) => setTimeout(() => reject(new Error("Auth check timed out")), AUTH_TIMEOUT_MS)
+          );
+          const response = await Promise.race([config.checkAuthStatus(), timeoutPromise]);
           if (response.authenticated && response.user) {
             const user = config.mapUser(response.user);
             config.onSignIn?.(user);
@@ -2711,4 +2739,4 @@ function createRuntimeConfigLoader(options) {
   return { loadRuntimeConfig, clearConfigCache };
 }
 
-export { AdapterRegistry, CacheDebugger, CacheMonitorBase, ErrorAdapter, EventBus, HttpClient, LogoutBroadcaster, QueryProvider, ServiceContainer, UnifiedCache, _clearResetFunction, _setResetFunction, broadcastLogout, cn, createAuthProvider, createAuthSelectors, createAuthStore, createRuntimeConfigLoader, Logger_default as default, formatBasisPoints, formatCompact, formatCurrency, formatNumber, formatPercent, frontendLogger, generateContentHash, generateStandardCacheKey, getQueryClient, initQueryConfig, log, logoutBroadcaster, parseStandardCacheKey, queryClient, resetQueryClient, roundTo, validateCacheKeyMetadata };
+export { AdapterRegistry, CacheDebugger, CacheMonitorBase, ErrorAdapter, EventBus, HttpClient, LogoutBroadcaster, QueryProvider, ServiceContainer, UnifiedCache, _clearResetFunction, _setResetFunction, broadcastLogout, cn, createAuthProvider, createAuthSelectors, createAuthStore, createRuntimeConfigLoader, Logger_default as default, formatBasisPoints, formatCompact, formatCurrency, formatNumber, formatPercent, formatSharpeRatio, frontendLogger, generateContentHash, generateStandardCacheKey, getQueryClient, initQueryConfig, log, logoutBroadcaster, parseStandardCacheKey, queryClient, resetQueryClient, roundTo, validateCacheKeyMetadata };

@@ -37,8 +37,9 @@ export class FrontendLogger {
   private sessionLifecycleStarted = false;
   private currentUserId: string | undefined = undefined;
   private sessionStartTime = Date.now();
+  private _initTimestamp: number | null = null;
   private readonly SESSION_SUMMARY_INTERVAL_MS = 5 * 60 * 1000;
-  private readonly QUEUE_FLUSH_DEBOUNCE_MS = 200;
+  private readonly QUEUE_FLUSH_DEBOUNCE_MS = 1000;
 
   // Phase 2A: Route-to-render timing
   private _routeTimings = new Map<string, number>();
@@ -96,7 +97,8 @@ export class FrontendLogger {
     this.initialized = true;
 
     if (!wasInitialized) {
-      this.sessionStartTime = Date.now();
+      this._initTimestamp = Date.now();
+      this.sessionStartTime = this._initTimestamp;
       this.flushPreInitBuffer();
     }
 
@@ -875,10 +877,16 @@ export class FrontendLogger {
 
   private scheduleQueueFlush(): void {
     this.clearQueueFlushTimer();
+    const elapsedSinceInit = this._initTimestamp === null
+      ? Number.POSITIVE_INFINITY
+      : Date.now() - this._initTimestamp;
+    const delay = elapsedSinceInit < 2000
+      ? Math.max(this.QUEUE_FLUSH_DEBOUNCE_MS, 2000 - elapsedSinceInit)
+      : this.QUEUE_FLUSH_DEBOUNCE_MS;
     this.queueFlushTimer = setTimeout(() => {
       this.queueFlushTimer = null;
       void this.processQueue();
-    }, this.QUEUE_FLUSH_DEBOUNCE_MS);
+    }, delay);
   }
 
   private clearQueueFlushTimer(): void {
@@ -921,12 +929,24 @@ export class FrontendLogger {
   private async processQueue(): Promise<void> {
     if (this.isProcessingQueue || this.logQueue.length === 0) return;
 
+    // Accumulation gate: if the queue is small and we're still in the startup
+    // window, defer the flush to accumulate more entries per batch. This reduces
+    // POST count from ~18 to ~3-4 by batching the trickle of adapter logs that
+    // arrive as each API response completes.
+    const elapsedSinceInit = this._initTimestamp === null
+      ? Number.POSITIVE_INFINITY
+      : Date.now() - this._initTimestamp;
+    if (this.logQueue.length < 10 && elapsedSinceInit < 10_000) {
+      this.scheduleQueueFlush();
+      return;
+    }
+
     this.clearQueueFlushTimer();
     this.isProcessingQueue = true;
 
     try {
       while (this.logQueue.length > 0) {
-        const batch = this.logQueue.splice(0, 10); // Process in batches of 10
+        const batch = this.logQueue.splice(0, 50); // Process in larger batches to reduce request volume
 
         await this.sendBatch(batch);
       }

@@ -1,237 +1,184 @@
 import type { EventBus } from '../events/EventBus';
-import { frontendLogger } from '../logging/Logger';
-import type { CacheMonitorBase } from './CacheMonitorBase';
-import type { UnifiedCache } from './UnifiedCache';
+import type { CacheMonitorBase, CacheMetrics } from './CacheMonitorBase';
+import type { CacheEntry, CacheStats, UnifiedCache } from './UnifiedCache';
 
 export interface CacheCoordinatorLike {
   clearAll?: () => void;
-}
-
-export interface CacheStateReport {
-  reportId: string;
-  timestamp: number;
-  layers: LayerState[];
-  summary: {
-    totalKeys: number;
-    totalMemoryUsage: number;
-    oldestEntry: number;
-    newestEntry: number;
-    layerCount: number;
-  };
-  keyCollisions: KeyCollision[];
-  recommendations: string[];
-}
-
-export interface LayerState {
-  layer: string;
-  keyCount: number;
-  memoryUsage: number;
-  oldestEntry: number;
-  newestEntry: number;
-  keys: CacheKeyInfo[];
-  health: 'healthy' | 'warning' | 'critical';
-  issues: string[];
 }
 
 export interface CacheKeyInfo {
   key: string;
   dataType?: string;
   scopeId?: string;
-  size: number;
-  age: number;
   ttl: number;
+  expiresAt: number;
+  ageMs: number;
+  remainingTtlMs: number | null;
   hitCount: number;
-  lastAccessed: number;
+  size: number;
   isExpired: boolean;
 }
 
-export interface KeyCollision {
-  key: string;
-  layers: string[];
-  potentialConflict: boolean;
-  recommendation: string;
+export interface LayerState {
+  layer: string;
+  entryCount: number;
+  memoryUsage: number;
+  keys: CacheKeyInfo[];
 }
 
-export interface InvalidationFlowDiagram {
-  trigger: string;
-  scopeId: string;
-  timestamp: number;
-  steps: InvalidationStep[];
-  duration: number;
-  success: boolean;
-  errors: string[];
+export interface CacheStateReport {
+  generatedAt: number;
+  totalEntries: number;
+  totalMemoryUsage: number;
+  stats: CacheStats;
+  layers: LayerState[];
+  activeDebugSession: DebugSession | null;
+}
+
+export interface KeyCollision {
+  normalizedKey: string;
+  keys: string[];
+  count: number;
 }
 
 export interface InvalidationStep {
-  step: number;
-  layer: string;
-  operation: string;
-  startTime: number;
-  endTime: number;
-  duration: number;
-  success: boolean;
-  keysAffected: string[];
-  error?: string;
+  timestamp: number;
+  event: string;
+  description: string;
+  scopeId?: string;
+}
+
+export interface InvalidationFlowDiagram {
+  dataType: string;
+  scopeId: string;
+  steps: InvalidationStep[];
+}
+
+export type DebugOperation = CacheMetrics;
+
+export interface DebugFilters {
+  layer?: string;
+  scopeIds?: string[];
+  dataTypes?: string[];
+  operations?: Array<DebugOperation['operation']>;
+  since?: number;
 }
 
 export interface DebugSession {
-  sessionId: string;
-  startTime: number;
-  operations: DebugOperation[];
+  id: string;
+  startedAt: number;
+  endedAt?: number;
   filters: DebugFilters;
-  isActive: boolean;
+  operations: DebugOperation[];
 }
 
-export interface DebugOperation {
-  timestamp: number;
-  layer: string;
-  operation: 'get' | 'set' | 'clear' | 'invalidate';
-  key: string;
+interface CacheEventLike {
   scopeId?: string;
+  portfolioId?: string;
   dataType?: string;
-  duration: number;
-  success: boolean;
+  timestamp?: number;
   metadata?: Record<string, unknown>;
 }
 
-export interface DebugFilters {
-  layers?: string[];
-  scopeIds?: string[];
-  dataTypes?: string[];
-  operations?: string[];
-  minDuration?: number;
+const DEBUG_EVENT_NAMES = [
+  'cache-hit',
+  'cache-miss',
+  'cache-updated',
+  'cache-invalidated',
+  'cache-cleared',
+  'risk-data-invalidated',
+  'portfolio-data-invalidated',
+  'user-data-invalidated',
+];
+
+function normalizeKeyInfo(entry: CacheEntry<unknown>): CacheKeyInfo {
+  const now = Date.now();
+  const remainingTtlMs = Number.isFinite(entry.expiresAt)
+    ? Math.max(entry.expiresAt - now, 0)
+    : null;
+
+  return {
+    key: entry.key,
+    dataType: entry.dataType,
+    scopeId: entry.scopeId,
+    ttl: entry.ttl,
+    expiresAt: entry.expiresAt,
+    ageMs: now - entry.createdAt,
+    remainingTtlMs,
+    hitCount: entry.hitCount,
+    size: entry.size,
+    isExpired: remainingTtlMs === 0 && Number.isFinite(entry.expiresAt),
+  };
 }
 
 export class CacheDebugger {
-  private debugSessions = new Map<string, DebugSession>();
   private activeSession: DebugSession | null = null;
-  private operationHistory: DebugOperation[] = [];
-  private readonly maxHistorySize = 1000;
+  private unsubscribeSessionEvents: Array<() => void> = [];
 
   constructor(
-    private eventBus: EventBus,
-    private unifiedCache: UnifiedCache,
-    private cacheMonitor: CacheMonitorBase,
-    private cacheCoordinator?: CacheCoordinatorLike,
-  ) {
-    this.setupGlobalDebugging();
-    frontendLogger.adapter.transformSuccess('CacheDebugger', 'Initialized with debugging tools');
-  }
-
-  private setupGlobalDebugging(): void {
-    if (typeof window !== 'undefined' && import.meta.env.DEV) {
-      const debugWindow = window as Window & {
-        cacheDebugger?: {
-          inspectState: () => CacheStateReport;
-          startSession: (filters?: DebugFilters) => string;
-          stopSession: () => DebugSession | null;
-          getPerformanceReport: () => ReturnType<CacheMonitorBase['generateReport']>;
-          visualizeInvalidation: (dataType: string) => InvalidationFlowDiagram;
-          findBottlenecks: () => ReturnType<CacheDebugger['findPerformanceBottlenecks']>;
-          analyzeKeyCollisions: () => KeyCollision[];
-          clearAllCaches: () => void;
-          help: () => void;
-        };
-      };
-
-      debugWindow.cacheDebugger = {
-        inspectState: () => this.inspectCacheState(),
-        startSession: (filters?: DebugFilters) => this.startDebugSession(filters),
-        stopSession: () => this.stopDebugSession(),
-        getPerformanceReport: () => this.cacheMonitor.generateReport(),
-        visualizeInvalidation: (dataType: string) => this.visualizeInvalidationFlow(dataType),
-        findBottlenecks: () => this.findPerformanceBottlenecks(),
-        analyzeKeyCollisions: () => this.analyzeKeyCollisions(),
-        clearAllCaches: () => this.clearAllCaches(),
-        help: () => this.showHelp(),
-      };
-
-      console.log('Cache Debugger loaded. Type `cacheDebugger.help()` for available commands.');
-    }
-  }
+    private readonly eventBus: EventBus,
+    private readonly unifiedCache: UnifiedCache,
+    private readonly cacheMonitor: CacheMonitorBase,
+    private readonly cacheCoordinator: CacheCoordinatorLike,
+  ) {}
 
   inspectCacheState(): CacheStateReport {
-    const reportId = `cache-state-${Date.now()}`;
-    const timestamp = Date.now();
-    const layers: LayerState[] = [];
+    const entries = this.unifiedCache.listEntries();
+    const groupedLayers = new Map<string, CacheKeyInfo[]>();
 
-    const unifiedCacheStats = this.unifiedCache.getStats();
-    const unifiedCacheKeys = this.extractCacheKeys('UnifiedCache');
-    layers.push({
-      layer: 'UnifiedCache',
-      keyCount: unifiedCacheStats.totalEntries,
-      memoryUsage: this.estimateMemoryUsage(unifiedCacheKeys),
-      oldestEntry: Math.min(...unifiedCacheKeys.map(k => k.lastAccessed)),
-      newestEntry: Math.max(...unifiedCacheKeys.map(k => k.lastAccessed)),
-      keys: unifiedCacheKeys,
-      health: this.assessLayerHealth(unifiedCacheKeys),
-      issues: this.identifyLayerIssues(unifiedCacheKeys),
+    entries.forEach(entry => {
+      const layer = entry.dataType ?? 'unknown';
+      const layerEntries = groupedLayers.get(layer) ?? [];
+      layerEntries.push(normalizeKeyInfo(entry));
+      groupedLayers.set(layer, layerEntries);
     });
 
-    const queryKeys = this.extractQueryCacheKeys();
-    layers.push({
-      layer: 'TanStackQuery',
-      keyCount: queryKeys.length,
-      memoryUsage: this.estimateMemoryUsage(queryKeys),
-      oldestEntry: Math.min(...queryKeys.map(k => k.lastAccessed)),
-      newestEntry: Math.max(...queryKeys.map(k => k.lastAccessed)),
-      keys: queryKeys,
-      health: this.assessLayerHealth(queryKeys),
-      issues: this.identifyLayerIssues(queryKeys),
-    });
+    const layers = Array.from(groupedLayers.entries()).map(([layer, keys]) => ({
+      layer,
+      entryCount: keys.length,
+      memoryUsage: keys.reduce((sum, key) => sum + key.size, 0),
+      keys,
+    }));
 
-    const totalKeys = layers.reduce((sum, layer) => sum + layer.keyCount, 0);
-    const totalMemoryUsage = layers.reduce((sum, layer) => sum + layer.memoryUsage, 0);
-    const oldestEntry = Math.min(...layers.map(l => l.oldestEntry));
-    const newestEntry = Math.max(...layers.map(l => l.newestEntry));
-    const keyCollisions = this.analyzeKeyCollisions();
-    const recommendations = this.generateRecommendations(layers, keyCollisions);
-
-    const report: CacheStateReport = {
-      reportId,
-      timestamp,
+    return {
+      generatedAt: Date.now(),
+      totalEntries: entries.length,
+      totalMemoryUsage: layers.reduce((sum, layer) => sum + layer.memoryUsage, 0),
+      stats: this.unifiedCache.getStats(),
       layers,
-      summary: {
-        totalKeys,
-        totalMemoryUsage,
-        oldestEntry,
-        newestEntry,
-        layerCount: layers.length,
-      },
-      keyCollisions,
-      recommendations,
+      activeDebugSession: this.activeSession ? {
+        ...this.activeSession,
+        operations: [...this.activeSession.operations],
+        filters: { ...this.activeSession.filters },
+      } : null,
     };
-
-    frontendLogger.adapter.transformSuccess('CacheDebugger', {
-      message: 'Cache state report generated',
-      reportId,
-      totalKeys,
-      totalMemoryUsage: Math.round(totalMemoryUsage / 1024),
-      layerCount: layers.length,
-    });
-
-    return report;
   }
 
   startDebugSession(filters: DebugFilters = {}): string {
-    const sessionId = `debug-session-${Date.now()}`;
+    if (this.activeSession) {
+      this.stopDebugSession();
+    }
 
-    const session: DebugSession = {
-      sessionId,
-      startTime: Date.now(),
+    const sessionId = `debug-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    this.activeSession = {
+      id: sessionId,
+      startedAt: Date.now(),
+      filters: { ...filters },
       operations: [],
-      filters,
-      isActive: true,
     };
 
-    this.debugSessions.set(sessionId, session);
-    this.activeSession = session;
-    this.setupSessionEventListeners(session);
+    this.unsubscribeSessionEvents = DEBUG_EVENT_NAMES.map(eventName => (
+      this.eventBus.on<CacheEventLike>(eventName, event => {
+        if (!this.activeSession) {
+          return;
+        }
 
-    frontendLogger.adapter.transformSuccess('CacheDebugger', {
-      message: `Debug session started: ${sessionId}`,
-      ...filters,
-    });
+        const operation = this.toDebugOperation(eventName, event);
+        if (this.matchesFilters(operation, this.activeSession.filters)) {
+          this.activeSession.operations.push(operation);
+        }
+      })
+    ));
 
     return sessionId;
   }
@@ -241,138 +188,47 @@ export class CacheDebugger {
       return null;
     }
 
-    this.activeSession.isActive = false;
-    const session = this.activeSession;
-    this.activeSession = null;
+    this.unsubscribeSessionEvents.forEach(unsubscribe => unsubscribe());
+    this.unsubscribeSessionEvents = [];
 
-    frontendLogger.adapter.transformSuccess('CacheDebugger', {
-      message: `Debug session stopped: ${session.sessionId}`,
-      duration: Date.now() - session.startTime,
-      operationCount: session.operations.length,
-    });
-
-    return session;
-  }
-
-  private setupSessionEventListeners(session: DebugSession): void {
-    const recordOperation = (operation: Partial<DebugOperation>) => {
-      if (!session.isActive) {
-        return;
-      }
-
-      if (session.filters.layers && !session.filters.layers.includes(operation.layer || '')) {
-        return;
-      }
-      if (session.filters.scopeIds && !session.filters.scopeIds.includes(operation.scopeId || '')) {
-        return;
-      }
-      if (session.filters.dataTypes && !session.filters.dataTypes.includes(operation.dataType || '')) {
-        return;
-      }
-      if (session.filters.operations && !session.filters.operations.includes(operation.operation || '')) {
-        return;
-      }
-      if (session.filters.minDuration && (operation.duration || 0) < session.filters.minDuration) {
-        return;
-      }
-
-      const debugOp: DebugOperation = {
-        timestamp: Date.now(),
-        layer: operation.layer || 'unknown',
-        operation: operation.operation || 'get',
-        key: operation.key || 'unknown',
-        scopeId: operation.scopeId,
-        dataType: operation.dataType,
-        duration: operation.duration || 0,
-        success: operation.success !== false,
-        metadata: operation.metadata,
-      };
-
-      session.operations.push(debugOp);
-      this.operationHistory.push(debugOp);
-
-      if (this.operationHistory.length > this.maxHistorySize) {
-        this.operationHistory = this.operationHistory.slice(-this.maxHistorySize);
-      }
+    const completedSession: DebugSession = {
+      ...this.activeSession,
+      endedAt: Date.now(),
+      operations: [...this.activeSession.operations],
+      filters: { ...this.activeSession.filters },
     };
 
-    this.eventBus.on('cache-updated', event => {
-      const eventKey = typeof event.metadata?.key === 'string' ? event.metadata.key : 'unknown';
-      recordOperation({
-        layer: event.source,
-        operation: 'set',
-        key: eventKey,
-        scopeId: (event as { scopeId?: string }).scopeId,
-        dataType: event.dataType,
-        duration: 0,
-      });
-    });
-
-    this.eventBus.on('cache-cleared', event => {
-      const eventPattern = typeof event.metadata?.pattern === 'string' ? event.metadata.pattern : 'bulk-clear';
-      recordOperation({
-        layer: event.source,
-        operation: 'clear',
-        key: eventPattern,
-        scopeId: (event as { scopeId?: string }).scopeId,
-        dataType: event.dataType,
-        duration: 0,
-      });
-    });
+    this.activeSession = null;
+    return completedSession;
   }
 
   visualizeInvalidationFlow(dataType: string): InvalidationFlowDiagram {
-    const timestamp = Date.now();
-    const steps: InvalidationStep[] = [
-      {
-        step: 1,
-        layer: 'CacheCoordinator',
-        operation: 'invalidateData',
-        startTime: timestamp,
-        endTime: timestamp + 10,
-        duration: 10,
-        success: true,
-        keysAffected: [`${dataType}-coordinator`],
-      },
-      {
-        step: 2,
-        layer: 'UnifiedCache',
-        operation: 'clearByType',
-        startTime: timestamp + 10,
-        endTime: timestamp + 25,
-        duration: 15,
-        success: true,
-        keysAffected: [`${dataType}-unified-1`, `${dataType}-unified-2`],
-      },
-      {
-        step: 3,
-        layer: 'TanStackQuery',
-        operation: 'invalidateQueries',
-        startTime: timestamp + 25,
-        endTime: timestamp + 40,
-        duration: 15,
-        success: true,
-        keysAffected: [`${dataType}-query-1`, `${dataType}-query-2`],
-      },
-    ];
+    const recentOperations = this.cacheMonitor
+      .generateReport(3600000)
+      .recentOperations
+      .filter(operation => operation.dataType === dataType)
+      .filter(operation => operation.operation === 'invalidate' || operation.operation === 'clear');
 
-    const diagram: InvalidationFlowDiagram = {
-      trigger: `${dataType}-invalidation`,
-      scopeId: 'example-scope',
-      timestamp,
+    const scopeId = recentOperations[0]?.scopeId ?? 'global';
+    const steps = recentOperations.length > 0
+      ? recentOperations.map(operation => ({
+        timestamp: operation.timestamp,
+        event: operation.operation,
+        description: `${operation.layer} ${operation.operation} on ${operation.key}`,
+        scopeId: operation.scopeId,
+      }))
+      : [{
+        timestamp: Date.now(),
+        event: 'none',
+        description: `No invalidation activity recorded for ${dataType}`,
+        scopeId,
+      }];
+
+    return {
+      dataType,
+      scopeId,
       steps,
-      duration: 40,
-      success: true,
-      errors: [],
     };
-
-    frontendLogger.adapter.transformSuccess('CacheDebugger', {
-      message: `Invalidation flow visualized for ${dataType}`,
-      stepCount: steps.length,
-      totalDuration: diagram.duration,
-    });
-
-    return diagram;
   }
 
   findPerformanceBottlenecks(): {
@@ -381,34 +237,40 @@ export class CacheDebugger {
     memoryHogs: { layer: string; usage: number }[];
     recommendations: string[];
   } {
-    const slowOperations = this.operationHistory
-      .filter(op => op.duration > 100)
-      .sort((a, b) => b.duration - a.duration)
-      .slice(0, 10);
+    const report = this.cacheMonitor.generateReport(3600000);
+    const slowOperations = report.recentOperations.filter(operation => operation.durationMs >= 150);
+    const missCounts = new Map<string, number>();
 
-    const missCount = new Map<string, number>();
-    this.operationHistory
-      .filter(op => op.operation === 'get' && !op.success)
-      .forEach(op => {
-        const count = missCount.get(op.key) || 0;
-        missCount.set(op.key, count + 1);
+    report.recentOperations
+      .filter(operation => operation.operation === 'miss')
+      .forEach(operation => {
+        missCounts.set(operation.key, (missCounts.get(operation.key) ?? 0) + 1);
       });
 
-    const frequentMisses = Array.from(missCount.entries())
-      .map(([key, count]) => ({ key, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10);
+    const frequentMisses = Array.from(missCounts.entries())
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 10)
+      .map(([key, count]) => ({ key, count }));
 
-    const memoryHogs = [
-      { layer: 'UnifiedCache', usage: 50 * 1024 * 1024 },
-      { layer: 'TanStackQuery', usage: 30 * 1024 * 1024 },
-    ];
+    const memoryHogs = this.inspectCacheState()
+      .layers
+      .map(layer => ({ layer: layer.layer, usage: layer.memoryUsage }))
+      .sort((left, right) => right.usage - left.usage)
+      .slice(0, 5);
 
-    const recommendations = [
-      ...(slowOperations.length > 0 ? [`Found ${slowOperations.length} slow operations. Consider optimizing data access patterns.`] : []),
-      ...(frequentMisses.length > 0 ? [`Found ${frequentMisses.length} frequently missed keys. Consider increasing TTL or preloading.`] : []),
-      ...(memoryHogs.some(h => h.usage > 100 * 1024 * 1024) ? ['High memory usage detected. Consider implementing cache size limits.'] : []),
-    ];
+    const recommendations: string[] = [];
+    if (report.alerts.highMissRateLayers.length > 0) {
+      recommendations.push(`Review miss-heavy layers: ${report.alerts.highMissRateLayers.join(', ')}`);
+    }
+    if (slowOperations.length > 0) {
+      recommendations.push('Reduce expensive cache population paths or increase warm-up coverage.');
+    }
+    if (memoryHogs.length > 0 && memoryHogs[0].usage > 250_000) {
+      recommendations.push(`Trim oversized cache layer ${memoryHogs[0].layer} or reduce TTLs.`);
+    }
+    if (recommendations.length === 0) {
+      recommendations.push('No obvious cache bottlenecks detected in the current sample window.');
+    }
 
     return {
       slowOperations,
@@ -418,148 +280,60 @@ export class CacheDebugger {
     };
   }
 
-  analyzeKeyCollisions(): KeyCollision[] {
-    const collisions: KeyCollision[] = [];
-    const commonKeys = ['portfolio-summary', 'risk-score', 'risk-analysis'];
-
-    commonKeys.forEach(key => {
-      collisions.push({
-        key,
-        layers: ['UnifiedCache', 'TanStackQuery'],
-        potentialConflict: false,
-        recommendation: `Key "${key}" is used across multiple layers but with proper namespacing.`,
-      });
-    });
-
-    return collisions;
+  clearAll(): void {
+    this.cacheCoordinator.clearAll?.();
   }
 
-  clearAllCaches(): void {
-    try {
-      this.unifiedCache.clear();
-      this.cacheCoordinator?.clearAll?.();
-      frontendLogger.adapter.transformSuccess('CacheDebugger', 'All caches cleared');
-    } catch (error) {
-      frontendLogger.adapter.transformError('CacheDebugger', error as Error, {
-        operation: 'clear-all-caches',
-      });
-    }
+  private toDebugOperation(eventName: string, event: CacheEventLike): DebugOperation {
+    const metadata = event.metadata ?? {};
+    const scopeId = typeof event.scopeId === 'string'
+      ? event.scopeId
+      : typeof event.portfolioId === 'string'
+        ? event.portfolioId
+        : undefined;
+
+    return {
+      layer: typeof metadata.layer === 'string' ? metadata.layer : 'debug-session',
+      key: typeof metadata.key === 'string' ? metadata.key : `${eventName}:${event.dataType ?? 'unknown'}`,
+      operation: eventName === 'cache-hit'
+        ? 'hit'
+        : eventName === 'cache-miss'
+          ? 'miss'
+          : eventName === 'cache-updated'
+            ? 'set'
+            : eventName === 'cache-cleared'
+              ? 'clear'
+              : 'invalidate',
+      durationMs: typeof metadata.durationMs === 'number' ? metadata.durationMs : 0,
+      timestamp: typeof event.timestamp === 'number' ? event.timestamp : Date.now(),
+      scopeId,
+      dataType: event.dataType,
+      success: true,
+      metadata,
+    };
   }
 
-  private showHelp(): void {
-    const help = `
-Cache Debugger Commands:
-
-State Inspection:
-  cacheDebugger.inspectState()           - Get current cache state report
-  cacheDebugger.getPerformanceReport()   - Get performance metrics
-
-Session Debugging:
-  cacheDebugger.startSession(filters)    - Start tracking cache operations
-  cacheDebugger.stopSession()            - Stop current debug session
-
-Analysis:
-  cacheDebugger.findBottlenecks()        - Find performance issues
-  cacheDebugger.analyzeKeyCollisions()   - Check for key conflicts
-  cacheDebugger.visualizeInvalidation(dataType) - Show invalidation flow
-
-Utilities:
-  cacheDebugger.clearAllCaches()         - Clear all caches (use carefully)
-  cacheDebugger.help()                   - Show this help
-
-Example filters for startSession():
-{
-  layers: ['UnifiedCache'],
-  scopeIds: ['scope-123'],
-  dataTypes: ['riskScore'],
-  operations: ['get', 'set'],
-  minDuration: 50
-}
-    `;
-
-    console.log(help);
-  }
-
-  private extractCacheKeys(_layer: string): CacheKeyInfo[] {
-    return [
-      {
-        key: 'risk-score-scope-123',
-        dataType: 'riskScore',
-        scopeId: 'scope-123',
-        size: 1024,
-        age: 30000,
-        ttl: 300000,
-        hitCount: 5,
-        lastAccessed: Date.now() - 30000,
-        isExpired: false,
-      },
-    ];
-  }
-
-  private extractQueryCacheKeys(): CacheKeyInfo[] {
-    return [
-      {
-        key: 'riskScore-scope-123',
-        dataType: 'riskScore',
-        scopeId: 'scope-123',
-        size: 2048,
-        age: 60000,
-        ttl: 300000,
-        hitCount: 3,
-        lastAccessed: Date.now() - 60000,
-        isExpired: false,
-      },
-    ];
-  }
-
-  private estimateMemoryUsage(keys: CacheKeyInfo[]): number {
-    return keys.reduce((sum, key) => sum + key.size, 0);
-  }
-
-  private assessLayerHealth(keys: CacheKeyInfo[]): 'healthy' | 'warning' | 'critical' {
-    const expiredCount = keys.filter(k => k.isExpired).length;
-    const expiredRatio = keys.length > 0 ? expiredCount / keys.length : 0;
-
-    if (expiredRatio > 0.5) {
-      return 'critical';
-    }
-    if (expiredRatio > 0.2) {
-      return 'warning';
-    }
-    return 'healthy';
-  }
-
-  private identifyLayerIssues(keys: CacheKeyInfo[]): string[] {
-    const issues: string[] = [];
-    const expiredCount = keys.filter(k => k.isExpired).length;
-    const lowHitCount = keys.filter(k => k.hitCount < 2).length;
-
-    if (expiredCount > 0) {
-      issues.push(`${expiredCount} expired entries found`);
-    }
-    if (lowHitCount > keys.length * 0.3) {
-      issues.push(`${lowHitCount} entries with low hit count`);
+  private matchesFilters(operation: DebugOperation, filters: DebugFilters): boolean {
+    if (filters.layer && operation.layer !== filters.layer) {
+      return false;
     }
 
-    return issues;
-  }
-
-  private generateRecommendations(layers: LayerState[], collisions: KeyCollision[]): string[] {
-    const recommendations: string[] = [];
-
-    layers.forEach(layer => {
-      if (layer.health === 'critical') {
-        recommendations.push(`${layer.layer}: Critical issues detected. Consider cache cleanup.`);
-      }
-      if (layer.memoryUsage > 50 * 1024 * 1024) {
-        recommendations.push(`${layer.layer}: High memory usage. Consider implementing size limits.`);
-      }
-    });
-
-    if (collisions.some(c => c.potentialConflict)) {
-      recommendations.push('Key collisions detected. Review cache key naming strategy.');
+    if (filters.scopeIds && filters.scopeIds.length > 0 && !filters.scopeIds.includes(operation.scopeId ?? '')) {
+      return false;
     }
 
-    return recommendations;
+    if (filters.dataTypes && filters.dataTypes.length > 0 && !filters.dataTypes.includes(operation.dataType ?? '')) {
+      return false;
+    }
+
+    if (filters.operations && filters.operations.length > 0 && !filters.operations.includes(operation.operation)) {
+      return false;
+    }
+
+    if (filters.since && operation.timestamp < filters.since) {
+      return false;
+    }
+
+    return true;
   }
 }

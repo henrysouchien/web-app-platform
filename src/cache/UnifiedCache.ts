@@ -1,371 +1,420 @@
-import type { CacheEvent } from '../events/EventBus';
-import { EventBus } from '../events/EventBus';
-import { frontendLogger } from '../logging/Logger';
+import type { EventBus } from '../events/EventBus';
+import type { CacheEntryMetadata, CacheOperationMetrics } from './types';
 
-export interface CacheEntry<T = unknown> {
+export interface CacheEntry<T = unknown> extends CacheEntryMetadata {
+  key: string;
   value: T;
-  timestamp: number;
   ttl: number;
-  scopeId?: string;
-  dataType?: string;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+  lastAccessedAt: number;
+  hitCount: number;
+  size: number;
 }
 
 export interface CacheStats {
-  totalEntries: number;
-  hitCount: number;
-  missCount: number;
-  hitRatio: number;
+  entries: number;
+  hits: number;
+  misses: number;
+  hitRate: number;
   entriesByType: Record<string, number>;
   entriesByScope: Record<string, number>;
+  expiredEntries: number;
+  memoryUsage: number;
+  totalOperations: number;
 }
 
 export interface CachePerformanceMetrics {
-  hitRatio: number;
-  avgResponseTime: number;
-  totalRequests: number;
-  errorRate: number;
-  entriesByType: Record<string, { hits: number; misses: number; errors: number }>;
-  recentOperations: Array<{
-    timestamp: number;
-    operation: 'hit' | 'miss' | 'clear' | 'error';
-    key: string;
-    responseTime?: number;
-    dataType?: string;
-  }>;
+  totalOperations: number;
+  hits: number;
+  misses: number;
+  writes: number;
+  hitRate: number;
+  averageHitTimeMs: number;
+  averageMissTimeMs: number;
+  recentOperations: CacheOperationMetrics[];
+}
+
+type CacheEventType = 'cache-hit' | 'cache-miss' | 'cache-updated' | 'cache-invalidated' | 'cache-cleared';
+
+function estimateSize(value: unknown): number {
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return 0;
+  }
+}
+
+function cloneEntry<T>(entry: CacheEntry<T>): CacheEntry<T> {
+  return { ...entry };
 }
 
 export class UnifiedCache {
-  private cache = new Map<string, CacheEntry>();
-  private performanceMetrics = {
-    totalRequests: 0,
-    totalHits: 0,
-    totalMisses: 0,
-    totalErrors: 0,
-    responseTimes: [] as number[],
-    operationLog: [] as CachePerformanceMetrics['recentOperations'],
-    typeMetrics: new Map<string, { hits: number; misses: number; errors: number }>(),
-  };
+  private readonly entries = new Map<string, CacheEntry<unknown>>();
+  private readonly recentOperations: CacheOperationMetrics[] = [];
+  private readonly maxTrackedOperations = 500;
+  private hitCount = 0;
+  private missCount = 0;
 
-  constructor(private eventBus: EventBus) {}
+  constructor(private readonly eventBus: EventBus) {}
 
   get<T>(
     key: string,
     factory: () => T,
     ttl: number,
-    metadata?: { scopeId?: string; dataType?: string },
+    metadata?: CacheEntryMetadata,
   ): T {
-    const startTime = performance.now();
-    this.performanceMetrics.totalRequests++;
+    const startedAt = Date.now();
+    const existingEntry = this.entries.get(key) as CacheEntry<T> | undefined;
 
-    try {
-      const entry = this.cache.get(key);
-      const now = Date.now();
+    if (existingEntry && !this.isExpired(existingEntry, startedAt)) {
+      existingEntry.hitCount += 1;
+      existingEntry.lastAccessedAt = startedAt;
+      this.hitCount += 1;
 
-      if (entry && now - entry.timestamp < entry.ttl) {
-        const responseTime = performance.now() - startTime;
-        this.recordOperation('hit', key, responseTime, metadata?.dataType);
-        frontendLogger.adapter.transformSuccess('UnifiedCache', `Cache hit: ${key}`);
-        return entry.value as T;
-      }
-
-      frontendLogger.adapter.transformStart('UnifiedCache', `Cache miss: ${key}`);
-      const value = factory();
-      const responseTime = performance.now() - startTime;
-      this.recordOperation('miss', key, responseTime, metadata?.dataType);
-
-      const cacheEntry: CacheEntry<T> = {
-        value,
-        timestamp: now,
-        ttl,
-        scopeId: metadata?.scopeId,
-        dataType: metadata?.dataType,
-      };
-
-      this.cache.set(key, cacheEntry);
-
-      try {
-        this.eventBus.emit<CacheEvent>('cache-updated', {
-          type: 'data-updated',
-          source: 'adapter',
-          scopeId: metadata?.scopeId,
-          dataType: metadata?.dataType,
-          timestamp: now,
-          metadata: { key, ttl },
-        });
-      } catch (error) {
-        frontendLogger.adapter.transformError('UnifiedCache', error as Error, {
-          operation: 'emit-cache-updated',
-          key,
-        });
-      }
-
-      frontendLogger.adapter.transformSuccess('UnifiedCache', `Cached: ${key}`);
-      return value;
-    } catch (error) {
-      const responseTime = performance.now() - startTime;
-      this.recordOperation('error', key, responseTime, metadata?.dataType);
-      frontendLogger.adapter.transformError('UnifiedCache', error as Error, { key, metadata });
-      throw error;
-    }
-  }
-
-  set<T>(key: string, value: T, ttl: number, metadata?: { scopeId?: string; dataType?: string }): void {
-    const now = Date.now();
-    const cacheEntry: CacheEntry<T> = {
-      value,
-      timestamp: now,
-      ttl,
-      scopeId: metadata?.scopeId,
-      dataType: metadata?.dataType,
-    };
-
-    this.cache.set(key, cacheEntry);
-
-    try {
-      this.eventBus.emit<CacheEvent>('cache-updated', {
-        type: 'data-updated',
-        source: 'adapter',
-        scopeId: metadata?.scopeId,
-        dataType: metadata?.dataType,
-        timestamp: now,
-        metadata: { key, ttl },
-      });
-    } catch (error) {
-      frontendLogger.adapter.transformError('UnifiedCache', error as Error, {
-        operation: 'emit-cache-updated',
+      this.recordOperation({
         key,
+        layer: 'unified-cache',
+        operation: 'hit',
+        durationMs: Date.now() - startedAt,
+        timestamp: startedAt,
+        scopeId: existingEntry.scopeId,
+        dataType: existingEntry.dataType,
+        success: true,
+        metadata: { ttl: existingEntry.ttl, size: existingEntry.size },
       });
+
+      this.emitEvent('cache-hit', existingEntry, {
+        key,
+        ttl: existingEntry.ttl,
+        durationMs: Date.now() - startedAt,
+        layer: 'unified-cache',
+      });
+
+      return existingEntry.value;
     }
 
-    frontendLogger.adapter.transformSuccess('UnifiedCache', `Set cache entry: ${key}`);
+    if (existingEntry) {
+      this.entries.delete(key);
+    }
+
+    this.missCount += 1;
+    const value = factory();
+    const entry = this.buildEntry(key, value, ttl, metadata);
+    this.entries.set(key, entry);
+
+    const durationMs = Date.now() - startedAt;
+    this.recordOperation({
+      key,
+      layer: 'unified-cache',
+      operation: 'miss',
+      durationMs,
+      timestamp: startedAt,
+      scopeId: entry.scopeId,
+      dataType: entry.dataType,
+      success: true,
+      metadata: { ttl: entry.ttl, size: entry.size },
+    });
+
+    this.emitEvent('cache-miss', entry, {
+      key,
+      ttl: entry.ttl,
+      durationMs,
+      layer: 'unified-cache',
+    });
+
+    this.emitEvent('cache-updated', entry, {
+      key,
+      ttl: entry.ttl,
+      durationMs,
+      layer: 'unified-cache',
+      operation: 'set',
+      size: entry.size,
+    });
+
+    return value;
   }
 
-  delete(key: string): boolean {
-    const deleted = this.cache.delete(key);
-    if (deleted) {
-      frontendLogger.adapter.transformSuccess('UnifiedCache', `Deleted cache entry: ${key}`);
-    }
-    return deleted;
+  set<T>(key: string, value: T, ttl: number, metadata?: CacheEntryMetadata): void {
+    const startedAt = Date.now();
+    const entry = this.buildEntry(key, value, ttl, metadata);
+    this.entries.set(key, entry);
+
+    const durationMs = Date.now() - startedAt;
+    this.recordOperation({
+      key,
+      layer: 'unified-cache',
+      operation: 'set',
+      durationMs,
+      timestamp: startedAt,
+      scopeId: entry.scopeId,
+      dataType: entry.dataType,
+      success: true,
+      metadata: { ttl: entry.ttl, size: entry.size },
+    });
+
+    this.emitEvent('cache-updated', entry, {
+      key,
+      ttl: entry.ttl,
+      durationMs,
+      layer: 'unified-cache',
+      operation: 'set',
+      size: entry.size,
+    });
   }
 
   clearByType(dataType: string, scopeId?: string): number {
-    let clearedCount = 0;
-    const keysToDelete: string[] = [];
-
-    for (const [key, entry] of Array.from(this.cache.entries())) {
-      const matchesType = entry.dataType === dataType;
-      const matchesScope = !scopeId || entry.scopeId === scopeId;
-
-      if (matchesType && matchesScope) {
-        keysToDelete.push(key);
-        clearedCount++;
-      }
-    }
-
-    keysToDelete.forEach(key => this.cache.delete(key));
-
-    if (clearedCount > 0) {
-      frontendLogger.adapter.transformSuccess(
-        'UnifiedCache',
-        `Cleared ${clearedCount} entries for type: ${dataType}${scopeId ? `, scope: ${scopeId}` : ''}`,
-      );
-
-      this.eventBus.emit<CacheEvent>('cache-cleared', {
-        type: 'cache-cleared',
-        source: 'adapter',
-        scopeId,
+    return this.clearMatchingEntries(
+      entry => entry.dataType === dataType && (!scopeId || entry.scopeId === scopeId),
+      {
         dataType,
-        timestamp: Date.now(),
-        metadata: { clearedCount },
-      });
-    }
-
-    return clearedCount;
-  }
-
-  clearByPattern(pattern: RegExp): number {
-    let clearedCount = 0;
-    const keysToDelete: string[] = [];
-
-    for (const key of Array.from(this.cache.keys())) {
-      if (pattern.test(key)) {
-        keysToDelete.push(key);
-        clearedCount++;
-      }
-    }
-
-    keysToDelete.forEach(key => this.cache.delete(key));
-
-    if (clearedCount > 0) {
-      frontendLogger.adapter.transformSuccess(
-        'UnifiedCache',
-        `Cleared ${clearedCount} entries matching pattern: ${pattern}`,
-      );
-
-      this.eventBus.emit<CacheEvent>('cache-cleared', {
-        type: 'cache-cleared',
-        source: 'adapter',
-        timestamp: Date.now(),
-        metadata: { clearedCount, pattern: pattern.toString() },
-      });
-    }
-
-    return clearedCount;
+        scopeId,
+        layer: 'unified-cache',
+      },
+    );
   }
 
   clearScope(scopeId: string): number {
-    let clearedCount = 0;
-    const keysToDelete: string[] = [];
-
-    for (const [key, entry] of Array.from(this.cache.entries())) {
-      if (entry.scopeId === scopeId) {
-        keysToDelete.push(key);
-        clearedCount++;
-      }
-    }
-
-    keysToDelete.forEach(key => this.cache.delete(key));
-
-    if (clearedCount > 0) {
-      frontendLogger.adapter.transformSuccess('UnifiedCache', `Cleared ${clearedCount} entries for scope: ${scopeId}`);
-
-      this.eventBus.emit<CacheEvent>('cache-cleared', {
-        type: 'cache-cleared',
-        source: 'adapter',
+    return this.clearMatchingEntries(
+      entry => entry.scopeId === scopeId,
+      {
         scopeId,
-        timestamp: Date.now(),
-        metadata: { clearedCount },
-      });
-    }
-
-    return clearedCount;
+        layer: 'unified-cache',
+      },
+    );
   }
 
   clear(): void {
-    const clearedCount = this.cache.size;
-    this.cache.clear();
+    const cleared = this.entries.size;
+    this.entries.clear();
 
-    frontendLogger.adapter.transformSuccess('UnifiedCache', `Cleared all cache entries (${clearedCount} total)`);
+    this.recordOperation({
+      key: '*',
+      layer: 'unified-cache',
+      operation: 'clear',
+      durationMs: 0,
+      timestamp: Date.now(),
+      success: true,
+      metadata: { clearedEntries: cleared },
+    });
 
-    this.eventBus.emit<CacheEvent>('cache-cleared', {
+    this.eventBus.emit('cache-cleared', {
       type: 'cache-cleared',
-      source: 'adapter',
+      source: 'service',
       timestamp: Date.now(),
-      metadata: { clearedCount },
+      metadata: {
+        clearedEntries: cleared,
+        layer: 'unified-cache',
+        operation: 'clear',
+      },
     });
   }
 
-  has(key: string): boolean {
-    const entry = this.cache.get(key);
+  clearByPattern(pattern: RegExp): number {
+    return this.clearMatchingEntries(
+      entry => pattern.test(entry.key),
+      {
+        pattern: pattern.source,
+        layer: 'unified-cache',
+      },
+    );
+  }
+
+  inspect<T = unknown>(key: string): CacheEntry<T> | null {
+    const entry = this.entries.get(key) as CacheEntry<T> | undefined;
     if (!entry) {
-      return false;
+      return null;
     }
 
-    const now = Date.now();
-    const isExpired = now - entry.timestamp >= entry.ttl;
-
-    if (isExpired) {
-      this.cache.delete(key);
-      return false;
+    if (this.isExpired(entry)) {
+      this.entries.delete(key);
+      return null;
     }
 
-    return true;
+    return cloneEntry(entry);
   }
 
-  inspect(key: string): CacheEntry | null {
-    return this.cache.get(key) || null;
-  }
+  listEntries<T = unknown>(): CacheEntry<T>[] {
+    this.pruneExpiredEntries();
 
-  getKeys(): string[] {
-    return Array.from(this.cache.keys());
-  }
-
-  private recordOperation(
-    operation: 'hit' | 'miss' | 'clear' | 'error',
-    key: string,
-    responseTime: number,
-    dataType?: string,
-  ): void {
-    if (operation === 'hit') {
-      this.performanceMetrics.totalHits++;
-    }
-    if (operation === 'miss') {
-      this.performanceMetrics.totalMisses++;
-    }
-    if (operation === 'error') {
-      this.performanceMetrics.totalErrors++;
-    }
-
-    this.performanceMetrics.responseTimes.push(responseTime);
-    if (this.performanceMetrics.responseTimes.length > 1000) {
-      this.performanceMetrics.responseTimes.shift();
-    }
-
-    if (dataType) {
-      if (!this.performanceMetrics.typeMetrics.has(dataType)) {
-        this.performanceMetrics.typeMetrics.set(dataType, { hits: 0, misses: 0, errors: 0 });
-      }
-      const typeStats = this.performanceMetrics.typeMetrics.get(dataType)!;
-      if (operation === 'hit') {
-        typeStats.hits++;
-      } else if (operation === 'miss') {
-        typeStats.misses++;
-      } else if (operation === 'error') {
-        typeStats.errors++;
-      }
-    }
-
-    this.performanceMetrics.operationLog.push({
-      timestamp: Date.now(),
-      operation,
-      key,
-      responseTime,
-      dataType,
-    });
-
-    if (this.performanceMetrics.operationLog.length > 100) {
-      this.performanceMetrics.operationLog.shift();
-    }
+    return Array.from(this.entries.values()).map(entry => cloneEntry(entry as CacheEntry<T>));
   }
 
   getStats(): CacheStats {
+    const expiredEntries = this.pruneExpiredEntries();
     const entriesByType: Record<string, number> = {};
     const entriesByScope: Record<string, number> = {};
+    let memoryUsage = 0;
 
-    for (const entry of Array.from(this.cache.values())) {
-      if (entry.dataType) {
-        entriesByType[entry.dataType] = (entriesByType[entry.dataType] || 0) + 1;
-      }
-      if (entry.scopeId) {
-        entriesByScope[entry.scopeId] = (entriesByScope[entry.scopeId] || 0) + 1;
-      }
-    }
+    this.entries.forEach(entry => {
+      const dataType = entry.dataType ?? 'unknown';
+      const scopeId = entry.scopeId ?? 'global';
+      entriesByType[dataType] = (entriesByType[dataType] ?? 0) + 1;
+      entriesByScope[scopeId] = (entriesByScope[scopeId] ?? 0) + 1;
+      memoryUsage += entry.size;
+    });
 
-    const totalRequests = this.performanceMetrics.totalHits + this.performanceMetrics.totalMisses;
+    const totalLookups = this.hitCount + this.missCount;
 
     return {
-      totalEntries: this.cache.size,
-      hitCount: this.performanceMetrics.totalHits,
-      missCount: this.performanceMetrics.totalMisses,
-      hitRatio: totalRequests > 0 ? this.performanceMetrics.totalHits / totalRequests : 0,
+      entries: this.entries.size,
+      hits: this.hitCount,
+      misses: this.missCount,
+      hitRate: totalLookups > 0 ? this.hitCount / totalLookups : 0,
       entriesByType,
       entriesByScope,
+      expiredEntries,
+      memoryUsage,
+      totalOperations: this.recentOperations.length,
     };
   }
 
-  getPerformanceMetrics(): CachePerformanceMetrics {
-    const totalRequests = this.performanceMetrics.totalRequests;
-    const avgResponseTime = this.performanceMetrics.responseTimes.length > 0
-      ? this.performanceMetrics.responseTimes.reduce((a, b) => a + b, 0) / this.performanceMetrics.responseTimes.length
+  getPerformanceMetrics(windowMs: number = 300000): CachePerformanceMetrics {
+    const cutoff = Date.now() - windowMs;
+    const operations = this.recentOperations.filter(operation => operation.timestamp >= cutoff);
+    const hitOperations = operations.filter(operation => operation.operation === 'hit');
+    const missOperations = operations.filter(operation => operation.operation === 'miss');
+    const writeOperations = operations.filter(operation => operation.operation === 'set');
+    const lookupOperations = hitOperations.length + missOperations.length;
+
+    const averageHitTimeMs = hitOperations.length > 0
+      ? hitOperations.reduce((sum, operation) => sum + operation.durationMs, 0) / hitOperations.length
+      : 0;
+    const averageMissTimeMs = missOperations.length > 0
+      ? missOperations.reduce((sum, operation) => sum + operation.durationMs, 0) / missOperations.length
       : 0;
 
     return {
-      hitRatio: totalRequests > 0 ? this.performanceMetrics.totalHits / totalRequests : 0,
-      avgResponseTime,
-      totalRequests,
-      errorRate: totalRequests > 0 ? this.performanceMetrics.totalErrors / totalRequests : 0,
-      entriesByType: Object.fromEntries(this.performanceMetrics.typeMetrics),
-      recentOperations: [...this.performanceMetrics.operationLog],
+      totalOperations: operations.length,
+      hits: hitOperations.length,
+      misses: missOperations.length,
+      writes: writeOperations.length,
+      hitRate: lookupOperations > 0 ? hitOperations.length / lookupOperations : 0,
+      averageHitTimeMs,
+      averageMissTimeMs,
+      recentOperations: operations.slice(-50),
     };
+  }
+
+  getRecentOperations(limit: number = 100): CacheOperationMetrics[] {
+    return this.recentOperations.slice(-limit);
+  }
+
+  private buildEntry<T>(
+    key: string,
+    value: T,
+    ttl: number,
+    metadata?: CacheEntryMetadata,
+  ): CacheEntry<T> {
+    const now = Date.now();
+    const normalizedTtl = Number.isFinite(ttl) && ttl > 0 ? ttl : 0;
+
+    return {
+      key,
+      value,
+      ttl: normalizedTtl,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: normalizedTtl > 0 ? now + normalizedTtl : Number.POSITIVE_INFINITY,
+      lastAccessedAt: now,
+      hitCount: 0,
+      size: estimateSize(value),
+      ...metadata,
+    };
+  }
+
+  private clearMatchingEntries(
+    predicate: (entry: CacheEntry<unknown>) => boolean,
+    metadata: Record<string, unknown>,
+  ): number {
+    const removedEntries: CacheEntry<unknown>[] = [];
+
+    this.entries.forEach(entry => {
+      if (predicate(entry)) {
+        removedEntries.push(entry);
+        this.entries.delete(entry.key);
+      }
+    });
+
+    if (removedEntries.length === 0) {
+      return 0;
+    }
+
+    const scopeId = removedEntries[0]?.scopeId;
+    const dataType = removedEntries[0]?.dataType;
+
+    this.recordOperation({
+      key: metadata.pattern ? String(metadata.pattern) : `${dataType ?? '*'}:${scopeId ?? '*'}`,
+      layer: 'unified-cache',
+      operation: 'invalidate',
+      durationMs: 0,
+      timestamp: Date.now(),
+      scopeId,
+      dataType,
+      success: true,
+      metadata: {
+        ...metadata,
+        clearedEntries: removedEntries.length,
+      },
+    });
+
+    this.eventBus.emit('cache-invalidated', {
+      type: 'cache-invalidated',
+      source: 'service',
+      scopeId,
+      dataType,
+      timestamp: Date.now(),
+      metadata: {
+        ...metadata,
+        clearedEntries: removedEntries.length,
+        keys: removedEntries.map(entry => entry.key),
+        operation: 'invalidate',
+      },
+    });
+
+    return removedEntries.length;
+  }
+
+  private pruneExpiredEntries(): number {
+    const now = Date.now();
+    let removed = 0;
+
+    this.entries.forEach(entry => {
+      if (this.isExpired(entry, now)) {
+        this.entries.delete(entry.key);
+        removed += 1;
+      }
+    });
+
+    return removed;
+  }
+
+  private isExpired(entry: CacheEntry<unknown>, now: number = Date.now()): boolean {
+    return Number.isFinite(entry.expiresAt) && entry.expiresAt <= now;
+  }
+
+  private recordOperation(operation: CacheOperationMetrics): void {
+    this.recentOperations.push(operation);
+    if (this.recentOperations.length > this.maxTrackedOperations) {
+      this.recentOperations.splice(0, this.recentOperations.length - this.maxTrackedOperations);
+    }
+  }
+
+  private emitEvent(
+    eventName: CacheEventType,
+    entry: CacheEntry<unknown>,
+    metadata: Record<string, unknown>,
+  ): void {
+    const eventType = eventName === 'cache-updated' ? 'data-updated' : eventName === 'cache-cleared' ? 'cache-cleared' : 'cache-invalidated';
+
+    this.eventBus.emit(eventName, {
+      type: eventType,
+      source: 'service',
+      scopeId: entry.scopeId,
+      dataType: entry.dataType,
+      timestamp: Date.now(),
+      metadata,
+    });
   }
 }

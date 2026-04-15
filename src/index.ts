@@ -56,7 +56,8 @@ export * from './utils/formatting';
 export { cn } from './utils/cn';
 
 // HTTP
-export { HttpClient, type RetryableHttpError } from './http/HttpClient';
+export { HttpClient, type HttpRequestOptions, type RetryableHttpError } from './http/HttpClient';
+export { UpgradeRequiredError } from './errors/UpgradeRequiredError';
 
 // Providers
 export {
