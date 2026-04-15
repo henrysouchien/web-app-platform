@@ -1,6 +1,6 @@
 {
   "name": "web-app-platform",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Generic web application infrastructure: auth factories, caching, logging, HTTP client, React Query provider, cross-tab sync",
   "author": "Henry Chien",
   "license": "SEE LICENSE IN LICENSE",
