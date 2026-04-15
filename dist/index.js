@@ -30,8 +30,9 @@ var FrontendLogger = class {
     this.sessionLifecycleStarted = false;
     this.currentUserId = void 0;
     this.sessionStartTime = Date.now();
+    this._initTimestamp = null;
     this.SESSION_SUMMARY_INTERVAL_MS = 5 * 60 * 1e3;
-    this.QUEUE_FLUSH_DEBOUNCE_MS = 200;
+    this.QUEUE_FLUSH_DEBOUNCE_MS = 1e3;
     // Phase 2A: Route-to-render timing
     this._routeTimings = /* @__PURE__ */ new Map();
     // Phase 2B: Navigation epoch for waterfall-relative request timing
@@ -377,7 +378,8 @@ var FrontendLogger = class {
     this.baseUrl = config.baseUrl;
     this.initialized = true;
     if (!wasInitialized) {
-      this.sessionStartTime = Date.now();
+      this._initTimestamp = Date.now();
+      this.sessionStartTime = this._initTimestamp;
       this.flushPreInitBuffer();
     }
     if (!this.sessionLifecycleStarted && this.isEnabled && typeof window !== "undefined") {
@@ -755,10 +757,12 @@ var FrontendLogger = class {
   }
   scheduleQueueFlush() {
     this.clearQueueFlushTimer();
+    const elapsedSinceInit = this._initTimestamp === null ? Number.POSITIVE_INFINITY : Date.now() - this._initTimestamp;
+    const delay = elapsedSinceInit < 2e3 ? Math.max(this.QUEUE_FLUSH_DEBOUNCE_MS, 2e3 - elapsedSinceInit) : this.QUEUE_FLUSH_DEBOUNCE_MS;
     this.queueFlushTimer = setTimeout(() => {
       this.queueFlushTimer = null;
       void this.processQueue();
-    }, this.QUEUE_FLUSH_DEBOUNCE_MS);
+    }, delay);
   }
   clearQueueFlushTimer() {
     if (this.queueFlushTimer !== null) {
@@ -792,11 +796,16 @@ var FrontendLogger = class {
   }
   async processQueue() {
     if (this.isProcessingQueue || this.logQueue.length === 0) return;
+    const elapsedSinceInit = this._initTimestamp === null ? Number.POSITIVE_INFINITY : Date.now() - this._initTimestamp;
+    if (this.logQueue.length < 10 && elapsedSinceInit < 1e4) {
+      this.scheduleQueueFlush();
+      return;
+    }
     this.clearQueueFlushTimer();
     this.isProcessingQueue = true;
     try {
       while (this.logQueue.length > 0) {
-        const batch = this.logQueue.splice(0, 10);
+        const batch = this.logQueue.splice(0, 50);
         await this.sendBatch(batch);
       }
     } catch (error) {
@@ -908,780 +917,645 @@ var EventBus = class {
 };
 
 // src/cache/UnifiedCache.ts
+function estimateSize(value) {
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return 0;
+  }
+}
+function cloneEntry(entry) {
+  return { ...entry };
+}
 var UnifiedCache = class {
   constructor(eventBus) {
     this.eventBus = eventBus;
-    this.cache = /* @__PURE__ */ new Map();
-    this.performanceMetrics = {
-      totalRequests: 0,
-      totalHits: 0,
-      totalMisses: 0,
-      totalErrors: 0,
-      responseTimes: [],
-      operationLog: [],
-      typeMetrics: /* @__PURE__ */ new Map()
-    };
+    this.entries = /* @__PURE__ */ new Map();
+    this.recentOperations = [];
+    this.maxTrackedOperations = 500;
+    this.hitCount = 0;
+    this.missCount = 0;
   }
   get(key, factory, ttl, metadata) {
-    const startTime = performance.now();
-    this.performanceMetrics.totalRequests++;
-    try {
-      const entry = this.cache.get(key);
-      const now = Date.now();
-      if (entry && now - entry.timestamp < entry.ttl) {
-        const responseTime2 = performance.now() - startTime;
-        this.recordOperation("hit", key, responseTime2, metadata?.dataType);
-        frontendLogger.adapter.transformSuccess("UnifiedCache", `Cache hit: ${key}`);
-        return entry.value;
-      }
-      frontendLogger.adapter.transformStart("UnifiedCache", `Cache miss: ${key}`);
-      const value = factory();
-      const responseTime = performance.now() - startTime;
-      this.recordOperation("miss", key, responseTime, metadata?.dataType);
-      const cacheEntry = {
-        value,
-        timestamp: now,
-        ttl,
-        scopeId: metadata?.scopeId,
-        dataType: metadata?.dataType
-      };
-      this.cache.set(key, cacheEntry);
-      try {
-        this.eventBus.emit("cache-updated", {
-          type: "data-updated",
-          source: "adapter",
-          scopeId: metadata?.scopeId,
-          dataType: metadata?.dataType,
-          timestamp: now,
-          metadata: { key, ttl }
-        });
-      } catch (error) {
-        frontendLogger.adapter.transformError("UnifiedCache", error, {
-          operation: "emit-cache-updated",
-          key
-        });
-      }
-      frontendLogger.adapter.transformSuccess("UnifiedCache", `Cached: ${key}`);
-      return value;
-    } catch (error) {
-      const responseTime = performance.now() - startTime;
-      this.recordOperation("error", key, responseTime, metadata?.dataType);
-      frontendLogger.adapter.transformError("UnifiedCache", error, { key, metadata });
-      throw error;
+    const startedAt = Date.now();
+    const existingEntry = this.entries.get(key);
+    if (existingEntry && !this.isExpired(existingEntry, startedAt)) {
+      existingEntry.hitCount += 1;
+      existingEntry.lastAccessedAt = startedAt;
+      this.hitCount += 1;
+      this.recordOperation({
+        key,
+        layer: "unified-cache",
+        operation: "hit",
+        durationMs: Date.now() - startedAt,
+        timestamp: startedAt,
+        scopeId: existingEntry.scopeId,
+        dataType: existingEntry.dataType,
+        success: true,
+        metadata: { ttl: existingEntry.ttl, size: existingEntry.size }
+      });
+      this.emitEvent("cache-hit", existingEntry, {
+        key,
+        ttl: existingEntry.ttl,
+        durationMs: Date.now() - startedAt,
+        layer: "unified-cache"
+      });
+      return existingEntry.value;
     }
+    if (existingEntry) {
+      this.entries.delete(key);
+    }
+    this.missCount += 1;
+    const value = factory();
+    const entry = this.buildEntry(key, value, ttl, metadata);
+    this.entries.set(key, entry);
+    const durationMs = Date.now() - startedAt;
+    this.recordOperation({
+      key,
+      layer: "unified-cache",
+      operation: "miss",
+      durationMs,
+      timestamp: startedAt,
+      scopeId: entry.scopeId,
+      dataType: entry.dataType,
+      success: true,
+      metadata: { ttl: entry.ttl, size: entry.size }
+    });
+    this.emitEvent("cache-miss", entry, {
+      key,
+      ttl: entry.ttl,
+      durationMs,
+      layer: "unified-cache"
+    });
+    this.emitEvent("cache-updated", entry, {
+      key,
+      ttl: entry.ttl,
+      durationMs,
+      layer: "unified-cache",
+      operation: "set",
+      size: entry.size
+    });
+    return value;
   }
   set(key, value, ttl, metadata) {
-    const now = Date.now();
-    const cacheEntry = {
-      value,
-      timestamp: now,
-      ttl,
-      scopeId: metadata?.scopeId,
-      dataType: metadata?.dataType
-    };
-    this.cache.set(key, cacheEntry);
-    try {
-      this.eventBus.emit("cache-updated", {
-        type: "data-updated",
-        source: "adapter",
-        scopeId: metadata?.scopeId,
-        dataType: metadata?.dataType,
-        timestamp: now,
-        metadata: { key, ttl }
-      });
-    } catch (error) {
-      frontendLogger.adapter.transformError("UnifiedCache", error, {
-        operation: "emit-cache-updated",
-        key
-      });
-    }
-    frontendLogger.adapter.transformSuccess("UnifiedCache", `Set cache entry: ${key}`);
-  }
-  delete(key) {
-    const deleted = this.cache.delete(key);
-    if (deleted) {
-      frontendLogger.adapter.transformSuccess("UnifiedCache", `Deleted cache entry: ${key}`);
-    }
-    return deleted;
+    const startedAt = Date.now();
+    const entry = this.buildEntry(key, value, ttl, metadata);
+    this.entries.set(key, entry);
+    const durationMs = Date.now() - startedAt;
+    this.recordOperation({
+      key,
+      layer: "unified-cache",
+      operation: "set",
+      durationMs,
+      timestamp: startedAt,
+      scopeId: entry.scopeId,
+      dataType: entry.dataType,
+      success: true,
+      metadata: { ttl: entry.ttl, size: entry.size }
+    });
+    this.emitEvent("cache-updated", entry, {
+      key,
+      ttl: entry.ttl,
+      durationMs,
+      layer: "unified-cache",
+      operation: "set",
+      size: entry.size
+    });
   }
   clearByType(dataType, scopeId) {
-    let clearedCount = 0;
-    const keysToDelete = [];
-    for (const [key, entry] of Array.from(this.cache.entries())) {
-      const matchesType = entry.dataType === dataType;
-      const matchesScope = !scopeId || entry.scopeId === scopeId;
-      if (matchesType && matchesScope) {
-        keysToDelete.push(key);
-        clearedCount++;
-      }
-    }
-    keysToDelete.forEach((key) => this.cache.delete(key));
-    if (clearedCount > 0) {
-      frontendLogger.adapter.transformSuccess(
-        "UnifiedCache",
-        `Cleared ${clearedCount} entries for type: ${dataType}${scopeId ? `, scope: ${scopeId}` : ""}`
-      );
-      this.eventBus.emit("cache-cleared", {
-        type: "cache-cleared",
-        source: "adapter",
-        scopeId,
+    return this.clearMatchingEntries(
+      (entry) => entry.dataType === dataType && (!scopeId || entry.scopeId === scopeId),
+      {
         dataType,
-        timestamp: Date.now(),
-        metadata: { clearedCount }
-      });
-    }
-    return clearedCount;
-  }
-  clearByPattern(pattern) {
-    let clearedCount = 0;
-    const keysToDelete = [];
-    for (const key of Array.from(this.cache.keys())) {
-      if (pattern.test(key)) {
-        keysToDelete.push(key);
-        clearedCount++;
+        scopeId,
+        layer: "unified-cache"
       }
-    }
-    keysToDelete.forEach((key) => this.cache.delete(key));
-    if (clearedCount > 0) {
-      frontendLogger.adapter.transformSuccess(
-        "UnifiedCache",
-        `Cleared ${clearedCount} entries matching pattern: ${pattern}`
-      );
-      this.eventBus.emit("cache-cleared", {
-        type: "cache-cleared",
-        source: "adapter",
-        timestamp: Date.now(),
-        metadata: { clearedCount, pattern: pattern.toString() }
-      });
-    }
-    return clearedCount;
+    );
   }
   clearScope(scopeId) {
-    let clearedCount = 0;
-    const keysToDelete = [];
-    for (const [key, entry] of Array.from(this.cache.entries())) {
-      if (entry.scopeId === scopeId) {
-        keysToDelete.push(key);
-        clearedCount++;
-      }
-    }
-    keysToDelete.forEach((key) => this.cache.delete(key));
-    if (clearedCount > 0) {
-      frontendLogger.adapter.transformSuccess("UnifiedCache", `Cleared ${clearedCount} entries for scope: ${scopeId}`);
-      this.eventBus.emit("cache-cleared", {
-        type: "cache-cleared",
-        source: "adapter",
+    return this.clearMatchingEntries(
+      (entry) => entry.scopeId === scopeId,
+      {
         scopeId,
-        timestamp: Date.now(),
-        metadata: { clearedCount }
-      });
-    }
-    return clearedCount;
+        layer: "unified-cache"
+      }
+    );
   }
   clear() {
-    const clearedCount = this.cache.size;
-    this.cache.clear();
-    frontendLogger.adapter.transformSuccess("UnifiedCache", `Cleared all cache entries (${clearedCount} total)`);
+    const cleared = this.entries.size;
+    this.entries.clear();
+    this.recordOperation({
+      key: "*",
+      layer: "unified-cache",
+      operation: "clear",
+      durationMs: 0,
+      timestamp: Date.now(),
+      success: true,
+      metadata: { clearedEntries: cleared }
+    });
     this.eventBus.emit("cache-cleared", {
       type: "cache-cleared",
-      source: "adapter",
+      source: "service",
       timestamp: Date.now(),
-      metadata: { clearedCount }
+      metadata: {
+        clearedEntries: cleared,
+        layer: "unified-cache",
+        operation: "clear"
+      }
     });
   }
-  has(key) {
-    const entry = this.cache.get(key);
-    if (!entry) {
-      return false;
-    }
-    const now = Date.now();
-    const isExpired = now - entry.timestamp >= entry.ttl;
-    if (isExpired) {
-      this.cache.delete(key);
-      return false;
-    }
-    return true;
+  clearByPattern(pattern) {
+    return this.clearMatchingEntries(
+      (entry) => pattern.test(entry.key),
+      {
+        pattern: pattern.source,
+        layer: "unified-cache"
+      }
+    );
   }
   inspect(key) {
-    return this.cache.get(key) || null;
+    const entry = this.entries.get(key);
+    if (!entry) {
+      return null;
+    }
+    if (this.isExpired(entry)) {
+      this.entries.delete(key);
+      return null;
+    }
+    return cloneEntry(entry);
   }
-  getKeys() {
-    return Array.from(this.cache.keys());
-  }
-  recordOperation(operation, key, responseTime, dataType) {
-    if (operation === "hit") {
-      this.performanceMetrics.totalHits++;
-    }
-    if (operation === "miss") {
-      this.performanceMetrics.totalMisses++;
-    }
-    if (operation === "error") {
-      this.performanceMetrics.totalErrors++;
-    }
-    this.performanceMetrics.responseTimes.push(responseTime);
-    if (this.performanceMetrics.responseTimes.length > 1e3) {
-      this.performanceMetrics.responseTimes.shift();
-    }
-    if (dataType) {
-      if (!this.performanceMetrics.typeMetrics.has(dataType)) {
-        this.performanceMetrics.typeMetrics.set(dataType, { hits: 0, misses: 0, errors: 0 });
-      }
-      const typeStats = this.performanceMetrics.typeMetrics.get(dataType);
-      if (operation === "hit") {
-        typeStats.hits++;
-      } else if (operation === "miss") {
-        typeStats.misses++;
-      } else if (operation === "error") {
-        typeStats.errors++;
-      }
-    }
-    this.performanceMetrics.operationLog.push({
-      timestamp: Date.now(),
-      operation,
-      key,
-      responseTime,
-      dataType
-    });
-    if (this.performanceMetrics.operationLog.length > 100) {
-      this.performanceMetrics.operationLog.shift();
-    }
+  listEntries() {
+    this.pruneExpiredEntries();
+    return Array.from(this.entries.values()).map((entry) => cloneEntry(entry));
   }
   getStats() {
+    const expiredEntries = this.pruneExpiredEntries();
     const entriesByType = {};
     const entriesByScope = {};
-    for (const entry of Array.from(this.cache.values())) {
-      if (entry.dataType) {
-        entriesByType[entry.dataType] = (entriesByType[entry.dataType] || 0) + 1;
-      }
-      if (entry.scopeId) {
-        entriesByScope[entry.scopeId] = (entriesByScope[entry.scopeId] || 0) + 1;
-      }
-    }
-    const totalRequests = this.performanceMetrics.totalHits + this.performanceMetrics.totalMisses;
+    let memoryUsage = 0;
+    this.entries.forEach((entry) => {
+      const dataType = entry.dataType ?? "unknown";
+      const scopeId = entry.scopeId ?? "global";
+      entriesByType[dataType] = (entriesByType[dataType] ?? 0) + 1;
+      entriesByScope[scopeId] = (entriesByScope[scopeId] ?? 0) + 1;
+      memoryUsage += entry.size;
+    });
+    const totalLookups = this.hitCount + this.missCount;
     return {
-      totalEntries: this.cache.size,
-      hitCount: this.performanceMetrics.totalHits,
-      missCount: this.performanceMetrics.totalMisses,
-      hitRatio: totalRequests > 0 ? this.performanceMetrics.totalHits / totalRequests : 0,
+      entries: this.entries.size,
+      hits: this.hitCount,
+      misses: this.missCount,
+      hitRate: totalLookups > 0 ? this.hitCount / totalLookups : 0,
       entriesByType,
-      entriesByScope
+      entriesByScope,
+      expiredEntries,
+      memoryUsage,
+      totalOperations: this.recentOperations.length
     };
   }
-  getPerformanceMetrics() {
-    const totalRequests = this.performanceMetrics.totalRequests;
-    const avgResponseTime = this.performanceMetrics.responseTimes.length > 0 ? this.performanceMetrics.responseTimes.reduce((a, b) => a + b, 0) / this.performanceMetrics.responseTimes.length : 0;
+  getPerformanceMetrics(windowMs = 3e5) {
+    const cutoff = Date.now() - windowMs;
+    const operations = this.recentOperations.filter((operation) => operation.timestamp >= cutoff);
+    const hitOperations = operations.filter((operation) => operation.operation === "hit");
+    const missOperations = operations.filter((operation) => operation.operation === "miss");
+    const writeOperations = operations.filter((operation) => operation.operation === "set");
+    const lookupOperations = hitOperations.length + missOperations.length;
+    const averageHitTimeMs = hitOperations.length > 0 ? hitOperations.reduce((sum, operation) => sum + operation.durationMs, 0) / hitOperations.length : 0;
+    const averageMissTimeMs = missOperations.length > 0 ? missOperations.reduce((sum, operation) => sum + operation.durationMs, 0) / missOperations.length : 0;
     return {
-      hitRatio: totalRequests > 0 ? this.performanceMetrics.totalHits / totalRequests : 0,
-      avgResponseTime,
-      totalRequests,
-      errorRate: totalRequests > 0 ? this.performanceMetrics.totalErrors / totalRequests : 0,
-      entriesByType: Object.fromEntries(this.performanceMetrics.typeMetrics),
-      recentOperations: [...this.performanceMetrics.operationLog]
+      totalOperations: operations.length,
+      hits: hitOperations.length,
+      misses: missOperations.length,
+      writes: writeOperations.length,
+      hitRate: lookupOperations > 0 ? hitOperations.length / lookupOperations : 0,
+      averageHitTimeMs,
+      averageMissTimeMs,
+      recentOperations: operations.slice(-50)
     };
+  }
+  getRecentOperations(limit = 100) {
+    return this.recentOperations.slice(-limit);
+  }
+  buildEntry(key, value, ttl, metadata) {
+    const now = Date.now();
+    const normalizedTtl = Number.isFinite(ttl) && ttl > 0 ? ttl : 0;
+    return {
+      key,
+      value,
+      ttl: normalizedTtl,
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: normalizedTtl > 0 ? now + normalizedTtl : Number.POSITIVE_INFINITY,
+      lastAccessedAt: now,
+      hitCount: 0,
+      size: estimateSize(value),
+      ...metadata
+    };
+  }
+  clearMatchingEntries(predicate, metadata) {
+    const removedEntries = [];
+    this.entries.forEach((entry) => {
+      if (predicate(entry)) {
+        removedEntries.push(entry);
+        this.entries.delete(entry.key);
+      }
+    });
+    if (removedEntries.length === 0) {
+      return 0;
+    }
+    const scopeId = removedEntries[0]?.scopeId;
+    const dataType = removedEntries[0]?.dataType;
+    this.recordOperation({
+      key: metadata.pattern ? String(metadata.pattern) : `${dataType ?? "*"}:${scopeId ?? "*"}`,
+      layer: "unified-cache",
+      operation: "invalidate",
+      durationMs: 0,
+      timestamp: Date.now(),
+      scopeId,
+      dataType,
+      success: true,
+      metadata: {
+        ...metadata,
+        clearedEntries: removedEntries.length
+      }
+    });
+    this.eventBus.emit("cache-invalidated", {
+      type: "cache-invalidated",
+      source: "service",
+      scopeId,
+      dataType,
+      timestamp: Date.now(),
+      metadata: {
+        ...metadata,
+        clearedEntries: removedEntries.length,
+        keys: removedEntries.map((entry) => entry.key),
+        operation: "invalidate"
+      }
+    });
+    return removedEntries.length;
+  }
+  pruneExpiredEntries() {
+    const now = Date.now();
+    let removed = 0;
+    this.entries.forEach((entry) => {
+      if (this.isExpired(entry, now)) {
+        this.entries.delete(entry.key);
+        removed += 1;
+      }
+    });
+    return removed;
+  }
+  isExpired(entry, now = Date.now()) {
+    return Number.isFinite(entry.expiresAt) && entry.expiresAt <= now;
+  }
+  recordOperation(operation) {
+    this.recentOperations.push(operation);
+    if (this.recentOperations.length > this.maxTrackedOperations) {
+      this.recentOperations.splice(0, this.recentOperations.length - this.maxTrackedOperations);
+    }
+  }
+  emitEvent(eventName, entry, metadata) {
+    const eventType = eventName === "cache-updated" ? "data-updated" : eventName === "cache-cleared" ? "cache-cleared" : "cache-invalidated";
+    this.eventBus.emit(eventName, {
+      type: eventType,
+      source: "service",
+      scopeId: entry.scopeId,
+      dataType: entry.dataType,
+      timestamp: Date.now(),
+      metadata
+    });
   }
 };
 
 // src/cache/CacheMonitorBase.ts
+var CACHE_EVENT_NAMES = [
+  "cache-hit",
+  "cache-miss",
+  "cache-updated",
+  "cache-invalidated",
+  "cache-cleared"
+];
+function toRecord(value) {
+  return value && typeof value === "object" ? value : {};
+}
 var CacheMonitorBase = class {
-  constructor(eventBus, config) {
+  constructor(eventBus, config = {}) {
     this.eventBus = eventBus;
-    this.config = config;
-    this.metrics = [];
-    this.layerStats = /* @__PURE__ */ new Map();
-    this.maxMetricsHistory = 1e4;
-    this.alertThresholds = {
-      hitRatio: 0.7,
-      responseTime: 1e3,
-      memoryUsage: 100 * 1024 * 1024,
-      missFrequency: 10
+    this.recentOperations = [];
+    this.unsubscribers = [];
+    this.config = {
+      eventNames: config.eventNames ?? [],
+      maxRecentOperations: config.maxRecentOperations ?? 500,
+      slowOperationThresholdMs: config.slowOperationThresholdMs ?? 150,
+      hotKeyThreshold: config.hotKeyThreshold ?? 5,
+      highMissRateThreshold: config.highMissRateThreshold ?? 0.4
     };
-    this.setupEventListeners();
-    frontendLogger.adapter.transformSuccess("CacheMonitorBase", "Initialized with event listeners");
-  }
-  setupEventListeners() {
-    this.eventBus.on("cache-updated", (event) => {
-      const eventKey = typeof event.metadata?.key === "string" ? event.metadata.key : "unknown";
-      this.trackCacheOperation({
-        layer: event.source || "unknown",
-        operation: "set",
-        key: eventKey,
-        responseTime: 0,
-        dataType: event.dataType,
-        scopeId: event.scopeId,
-        timestamp: event.timestamp || Date.now()
-      });
-    });
-    this.eventBus.on("cache-cleared", (event) => {
-      const metadataPattern = typeof event.metadata?.pattern === "string" ? event.metadata.pattern : null;
-      const metadataKey = typeof event.metadata?.key === "string" ? event.metadata.key : null;
-      this.trackCacheOperation({
-        layer: event.source || "unknown",
-        operation: "clear",
-        key: metadataPattern || metadataKey || "bulk-clear",
-        responseTime: 0,
-        dataType: event.dataType,
-        scopeId: event.scopeId,
-        timestamp: event.timestamp || Date.now()
-      });
-    });
-    Array.from(new Set(this.config.eventNames)).forEach((eventName) => {
-      this.eventBus.on(eventName, (event) => {
-        this.trackCacheOperation({
-          layer: event.source || "coordinator",
-          operation: "invalidate",
-          key: event.scopeId ? `${eventName}-${event.scopeId}` : eventName,
-          responseTime: 0,
-          dataType: event.dataType,
-          scopeId: event.scopeId,
-          timestamp: event.timestamp || Date.now()
-        });
-      });
-    });
+    this.subscribeToEvents();
   }
   trackCacheHit(layer, key, responseTime, dataType, scopeId) {
-    this.trackCacheOperation({
+    this.recordMetric({
       layer,
-      operation: "hit",
       key,
-      responseTime,
-      dataType,
+      operation: "hit",
+      durationMs: responseTime,
+      timestamp: Date.now(),
       scopeId,
-      timestamp: Date.now()
+      dataType,
+      success: true
     });
   }
   trackCacheMiss(layer, key, fetchTime, dataType, scopeId) {
-    this.trackCacheOperation({
+    this.recordMetric({
       layer,
-      operation: "miss",
       key,
-      responseTime: fetchTime,
-      dataType,
+      operation: "miss",
+      durationMs: fetchTime,
+      timestamp: Date.now(),
       scopeId,
-      timestamp: Date.now()
+      dataType,
+      success: true
     });
-  }
-  trackCacheOperation(metric) {
-    this.metrics.push(metric);
-    if (this.metrics.length > this.maxMetricsHistory) {
-      this.metrics = this.metrics.slice(-this.maxMetricsHistory);
-    }
-    this.updateLayerStats(metric);
-    if (metric.operation === "miss" && metric.responseTime > this.alertThresholds.responseTime) {
-      frontendLogger.adapter.transformError("CacheMonitorBase", new Error("Slow cache miss detected"), {
-        layer: metric.layer,
-        key: metric.key,
-        responseTime: metric.responseTime
-      });
-    }
-  }
-  updateLayerStats(metric) {
-    const layerKey = metric.layer;
-    let stats = this.layerStats.get(layerKey);
-    if (!stats) {
-      stats = {
-        layer: layerKey,
-        totalOperations: 0,
-        hits: 0,
-        misses: 0,
-        hitRatio: 0,
-        avgResponseTime: 0,
-        totalResponseTime: 0,
-        cacheSize: 0,
-        memoryUsage: 0,
-        lastActivity: Date.now()
-      };
-      this.layerStats.set(layerKey, stats);
-    }
-    stats.totalOperations++;
-    stats.lastActivity = metric.timestamp;
-    stats.totalResponseTime += metric.responseTime;
-    stats.avgResponseTime = stats.totalResponseTime / stats.totalOperations;
-    if (metric.operation === "hit") {
-      stats.hits++;
-    } else if (metric.operation === "miss") {
-      stats.misses++;
-    }
-    const totalHitMissOps = stats.hits + stats.misses;
-    if (totalHitMissOps > 0) {
-      stats.hitRatio = stats.hits / totalHitMissOps;
-    }
-    if (metric.cacheSize !== void 0) {
-      stats.cacheSize = metric.cacheSize;
-    }
-    if (metric.memoryUsage !== void 0) {
-      stats.memoryUsage = metric.memoryUsage;
-    }
   }
   generateReport(timeRangeMs = 3e5) {
-    const now = Date.now();
-    const startTime = now - timeRangeMs;
-    const recentMetrics = this.metrics.filter((m) => m.timestamp >= startTime);
-    const layers = Array.from(this.layerStats.values());
-    const totalOperations = layers.reduce((sum, layer) => sum + layer.totalOperations, 0);
-    const totalHits = layers.reduce((sum, layer) => sum + layer.hits, 0);
-    const totalMisses = layers.reduce((sum, layer) => sum + layer.misses, 0);
-    const overallHitRatio = totalHits + totalMisses > 0 ? totalHits / (totalHits + totalMisses) : 0;
-    const avgResponseTime = layers.length > 0 ? layers.reduce((sum, layer) => sum + layer.avgResponseTime, 0) / layers.length : 0;
-    const totalMemoryUsage = layers.reduce((sum, layer) => sum + layer.memoryUsage, 0);
-    const mostActiveLayer = layers.reduce(
-      (max, layer) => layer.totalOperations > max.totalOperations ? layer : max,
-      layers[0] || { layer: "none", totalOperations: 0 }
-    );
-    const slowestLayer = layers.reduce(
-      (max, layer) => layer.avgResponseTime > max.avgResponseTime ? layer : max,
-      layers[0] || { layer: "none", avgResponseTime: 0 }
-    );
-    const recommendations = this.generateRecommendations(layers);
-    const report = {
-      reportId: `cache-report-${now}`,
-      generatedAt: now,
-      timeRange: {
-        start: startTime,
-        end: now,
-        durationMs: timeRangeMs
-      },
+    const cutoff = Date.now() - timeRangeMs;
+    const operations = this.recentOperations.filter((operation) => operation.timestamp >= cutoff);
+    const layers = this.buildLayerPerformance(operations);
+    const hits = operations.filter((operation) => operation.operation === "hit").length;
+    const misses = operations.filter((operation) => operation.operation === "miss").length;
+    const totalLookups = hits + misses;
+    return {
+      generatedAt: Date.now(),
+      timeRangeMs,
+      totalOperations: operations.length,
+      hitRate: totalLookups > 0 ? hits / totalLookups : 0,
       layers,
-      summary: {
-        totalOperations,
-        overallHitRatio,
-        avgResponseTime,
-        totalMemoryUsage,
-        mostActiveLayer: mostActiveLayer.layer,
-        slowestLayer: slowestLayer.layer,
-        recommendations
-      },
-      recentOperations: recentMetrics.slice(-50)
+      recentOperations: operations.slice(-100),
+      alerts: this.buildAlerts(operations, layers)
     };
-    frontendLogger.adapter.transformSuccess("CacheMonitorBase", {
-      message: "Performance report generated",
-      reportId: report.reportId,
-      totalOperations,
-      overallHitRatio: Math.round(overallHitRatio * 100),
-      layerCount: layers.length
-    });
-    return report;
-  }
-  generateRecommendations(layers) {
-    const recommendations = [];
-    layers.forEach((layer) => {
-      if (layer.hitRatio < this.alertThresholds.hitRatio) {
-        recommendations.push(`${layer.layer}: Low hit ratio (${Math.round(layer.hitRatio * 100)}%). Consider increasing TTL or cache size.`);
-      }
-      if (layer.avgResponseTime > this.alertThresholds.responseTime) {
-        recommendations.push(`${layer.layer}: Slow operations (${Math.round(layer.avgResponseTime)}ms avg). Consider optimizing data access patterns.`);
-      }
-      if (layer.memoryUsage > this.alertThresholds.memoryUsage) {
-        recommendations.push(`${layer.layer}: High memory usage (${Math.round(layer.memoryUsage / 1024 / 1024)}MB). Consider implementing cache size limits.`);
-      }
-    });
-    if (recommendations.length === 0) {
-      recommendations.push("Cache performance is within acceptable thresholds.");
-    }
-    return recommendations;
-  }
-  getAlerts() {
-    const layers = Array.from(this.layerStats.values());
-    return {
-      lowHitRatio: layers.filter((layer) => layer.hitRatio < this.alertThresholds.hitRatio).map((layer) => ({
-        layer: layer.layer,
-        ratio: layer.hitRatio,
-        threshold: this.alertThresholds.hitRatio
-      })),
-      slowOperations: layers.filter((layer) => layer.avgResponseTime > this.alertThresholds.responseTime).map((layer) => ({
-        layer: layer.layer,
-        avgTime: layer.avgResponseTime,
-        threshold: this.alertThresholds.responseTime
-      })),
-      highMemoryUsage: layers.filter((layer) => layer.memoryUsage > this.alertThresholds.memoryUsage).map((layer) => ({
-        layer: layer.layer,
-        usage: layer.memoryUsage,
-        threshold: this.alertThresholds.memoryUsage
-      })),
-      frequentMisses: this.getFrequentMisses()
-    };
-  }
-  getFrequentMisses() {
-    const missCount = /* @__PURE__ */ new Map();
-    this.metrics.filter((m) => m.operation === "miss").forEach((m) => {
-      const key = `${m.layer}:${m.key}`;
-      const existing = missCount.get(key);
-      if (existing) {
-        existing.count++;
-      } else {
-        missCount.set(key, { count: 1, layer: m.layer });
-      }
-    });
-    return Array.from(missCount.entries()).filter(([_, data]) => data.count >= this.alertThresholds.missFrequency).map(([key, data]) => ({
-      key: key.split(":")[1],
-      count: data.count,
-      layer: data.layer
-    })).sort((a, b) => b.count - a.count);
-  }
-  getRealtimeStats() {
-    return {
-      layers: Array.from(this.layerStats.values()),
-      alerts: this.getAlerts()
-    };
-  }
-  clearMetrics() {
-    this.metrics = [];
-    this.layerStats.clear();
-    frontendLogger.adapter.transformSuccess("CacheMonitorBase", "All metrics cleared");
   }
   getLayerMetrics(layer) {
-    return this.metrics.filter((m) => m.layer === layer);
+    return this.recentOperations.filter((operation) => operation.layer === layer);
   }
   getScopeMetrics(scopeId) {
-    return this.metrics.filter((m) => m.scopeId === scopeId);
+    return this.recentOperations.filter((operation) => operation.scopeId === scopeId);
+  }
+  getRecentOperations(limit = 100) {
+    return this.recentOperations.slice(-limit);
+  }
+  dispose() {
+    this.unsubscribers.forEach((unsubscribe) => unsubscribe());
+    this.unsubscribers.length = 0;
+  }
+  subscribeToEvents() {
+    const subscribedEvents = /* @__PURE__ */ new Set([...CACHE_EVENT_NAMES, ...this.config.eventNames]);
+    subscribedEvents.forEach((eventName) => {
+      const unsubscribe = this.eventBus.on(eventName, (event) => {
+        this.recordMetric(this.metricFromEvent(eventName, event));
+      });
+      this.unsubscribers.push(unsubscribe);
+    });
+  }
+  metricFromEvent(eventName, event) {
+    const metadata = toRecord(event.metadata);
+    const scopeId = typeof event.scopeId === "string" ? event.scopeId : typeof event.portfolioId === "string" ? event.portfolioId : void 0;
+    const key = typeof metadata.key === "string" ? metadata.key : `${eventName}:${event.dataType ?? "unknown"}:${scopeId ?? "global"}`;
+    const durationMs = typeof metadata.durationMs === "number" ? metadata.durationMs : 0;
+    const layer = typeof metadata.layer === "string" ? metadata.layer : this.resolveLayer(eventName);
+    return {
+      layer,
+      key,
+      operation: this.resolveOperation(eventName),
+      durationMs,
+      timestamp: typeof event.timestamp === "number" ? event.timestamp : Date.now(),
+      scopeId,
+      dataType: event.dataType,
+      success: true,
+      metadata
+    };
+  }
+  resolveLayer(eventName) {
+    if (eventName.startsWith("cache-")) {
+      return "unified-cache";
+    }
+    if (eventName.includes("risk")) {
+      return "risk-coordinator";
+    }
+    if (eventName.includes("portfolio")) {
+      return "portfolio-coordinator";
+    }
+    return "cache-monitor";
+  }
+  resolveOperation(eventName) {
+    if (eventName === "cache-hit") {
+      return "hit";
+    }
+    if (eventName === "cache-miss") {
+      return "miss";
+    }
+    if (eventName === "cache-updated") {
+      return "set";
+    }
+    if (eventName === "cache-cleared") {
+      return "clear";
+    }
+    return "invalidate";
+  }
+  recordMetric(metric) {
+    this.recentOperations.push(metric);
+    if (this.recentOperations.length > this.config.maxRecentOperations) {
+      this.recentOperations.splice(0, this.recentOperations.length - this.config.maxRecentOperations);
+    }
+  }
+  buildLayerPerformance(operations) {
+    const byLayer = /* @__PURE__ */ new Map();
+    operations.forEach((operation) => {
+      const layerOperations = byLayer.get(operation.layer) ?? [];
+      layerOperations.push(operation);
+      byLayer.set(operation.layer, layerOperations);
+    });
+    return Array.from(byLayer.entries()).map(([layer, layerOperations]) => {
+      const hits = layerOperations.filter((operation) => operation.operation === "hit").length;
+      const misses = layerOperations.filter((operation) => operation.operation === "miss").length;
+      const totalLookups = hits + misses;
+      const totalDuration = layerOperations.reduce((sum, operation) => sum + operation.durationMs, 0);
+      return {
+        layer,
+        operations: layerOperations.length,
+        hits,
+        misses,
+        hitRate: totalLookups > 0 ? hits / totalLookups : 0,
+        averageResponseTime: layerOperations.length > 0 ? totalDuration / layerOperations.length : 0,
+        slowOperations: layerOperations.filter(
+          (operation) => operation.durationMs >= this.config.slowOperationThresholdMs
+        ).length
+      };
+    });
+  }
+  buildAlerts(operations, layers) {
+    const keyCounts = /* @__PURE__ */ new Map();
+    const missCounts = /* @__PURE__ */ new Map();
+    operations.forEach((operation) => {
+      keyCounts.set(operation.key, (keyCounts.get(operation.key) ?? 0) + 1);
+      if (operation.operation === "hit" || operation.operation === "miss") {
+        const counts = missCounts.get(operation.layer) ?? { misses: 0, totalLookups: 0 };
+        counts.totalLookups += 1;
+        if (operation.operation === "miss") {
+          counts.misses += 1;
+        }
+        missCounts.set(operation.layer, counts);
+      }
+    });
+    return {
+      slowLayers: layers.filter((layer) => layer.slowOperations > 0).map((layer) => layer.layer),
+      hotKeys: Array.from(keyCounts.entries()).filter(([, count]) => count >= this.config.hotKeyThreshold).map(([key]) => key),
+      highMissRateLayers: Array.from(missCounts.entries()).filter(([, counts]) => counts.totalLookups > 0 && counts.misses / counts.totalLookups >= this.config.highMissRateThreshold).map(([layer]) => layer)
+    };
   }
 };
 
 // src/cache/CacheDebugger.ts
+var DEBUG_EVENT_NAMES = [
+  "cache-hit",
+  "cache-miss",
+  "cache-updated",
+  "cache-invalidated",
+  "cache-cleared",
+  "risk-data-invalidated",
+  "portfolio-data-invalidated",
+  "user-data-invalidated"
+];
+function normalizeKeyInfo(entry) {
+  const now = Date.now();
+  const remainingTtlMs = Number.isFinite(entry.expiresAt) ? Math.max(entry.expiresAt - now, 0) : null;
+  return {
+    key: entry.key,
+    dataType: entry.dataType,
+    scopeId: entry.scopeId,
+    ttl: entry.ttl,
+    expiresAt: entry.expiresAt,
+    ageMs: now - entry.createdAt,
+    remainingTtlMs,
+    hitCount: entry.hitCount,
+    size: entry.size,
+    isExpired: remainingTtlMs === 0 && Number.isFinite(entry.expiresAt)
+  };
+}
 var CacheDebugger = class {
   constructor(eventBus, unifiedCache, cacheMonitor, cacheCoordinator) {
     this.eventBus = eventBus;
     this.unifiedCache = unifiedCache;
     this.cacheMonitor = cacheMonitor;
     this.cacheCoordinator = cacheCoordinator;
-    this.debugSessions = /* @__PURE__ */ new Map();
     this.activeSession = null;
-    this.operationHistory = [];
-    this.maxHistorySize = 1e3;
-    this.setupGlobalDebugging();
-    frontendLogger.adapter.transformSuccess("CacheDebugger", "Initialized with debugging tools");
-  }
-  setupGlobalDebugging() {
-    if (typeof window !== "undefined" && undefined.DEV) {
-      const debugWindow = window;
-      debugWindow.cacheDebugger = {
-        inspectState: () => this.inspectCacheState(),
-        startSession: (filters) => this.startDebugSession(filters),
-        stopSession: () => this.stopDebugSession(),
-        getPerformanceReport: () => this.cacheMonitor.generateReport(),
-        visualizeInvalidation: (dataType) => this.visualizeInvalidationFlow(dataType),
-        findBottlenecks: () => this.findPerformanceBottlenecks(),
-        analyzeKeyCollisions: () => this.analyzeKeyCollisions(),
-        clearAllCaches: () => this.clearAllCaches(),
-        help: () => this.showHelp()
-      };
-      console.log("Cache Debugger loaded. Type `cacheDebugger.help()` for available commands.");
-    }
+    this.unsubscribeSessionEvents = [];
   }
   inspectCacheState() {
-    const reportId = `cache-state-${Date.now()}`;
-    const timestamp = Date.now();
-    const layers = [];
-    const unifiedCacheStats = this.unifiedCache.getStats();
-    const unifiedCacheKeys = this.extractCacheKeys("UnifiedCache");
-    layers.push({
-      layer: "UnifiedCache",
-      keyCount: unifiedCacheStats.totalEntries,
-      memoryUsage: this.estimateMemoryUsage(unifiedCacheKeys),
-      oldestEntry: Math.min(...unifiedCacheKeys.map((k) => k.lastAccessed)),
-      newestEntry: Math.max(...unifiedCacheKeys.map((k) => k.lastAccessed)),
-      keys: unifiedCacheKeys,
-      health: this.assessLayerHealth(unifiedCacheKeys),
-      issues: this.identifyLayerIssues(unifiedCacheKeys)
+    const entries = this.unifiedCache.listEntries();
+    const groupedLayers = /* @__PURE__ */ new Map();
+    entries.forEach((entry) => {
+      const layer = entry.dataType ?? "unknown";
+      const layerEntries = groupedLayers.get(layer) ?? [];
+      layerEntries.push(normalizeKeyInfo(entry));
+      groupedLayers.set(layer, layerEntries);
     });
-    const queryKeys = this.extractQueryCacheKeys();
-    layers.push({
-      layer: "TanStackQuery",
-      keyCount: queryKeys.length,
-      memoryUsage: this.estimateMemoryUsage(queryKeys),
-      oldestEntry: Math.min(...queryKeys.map((k) => k.lastAccessed)),
-      newestEntry: Math.max(...queryKeys.map((k) => k.lastAccessed)),
-      keys: queryKeys,
-      health: this.assessLayerHealth(queryKeys),
-      issues: this.identifyLayerIssues(queryKeys)
-    });
-    const totalKeys = layers.reduce((sum, layer) => sum + layer.keyCount, 0);
-    const totalMemoryUsage = layers.reduce((sum, layer) => sum + layer.memoryUsage, 0);
-    const oldestEntry = Math.min(...layers.map((l) => l.oldestEntry));
-    const newestEntry = Math.max(...layers.map((l) => l.newestEntry));
-    const keyCollisions = this.analyzeKeyCollisions();
-    const recommendations = this.generateRecommendations(layers, keyCollisions);
-    const report = {
-      reportId,
-      timestamp,
+    const layers = Array.from(groupedLayers.entries()).map(([layer, keys]) => ({
+      layer,
+      entryCount: keys.length,
+      memoryUsage: keys.reduce((sum, key) => sum + key.size, 0),
+      keys
+    }));
+    return {
+      generatedAt: Date.now(),
+      totalEntries: entries.length,
+      totalMemoryUsage: layers.reduce((sum, layer) => sum + layer.memoryUsage, 0),
+      stats: this.unifiedCache.getStats(),
       layers,
-      summary: {
-        totalKeys,
-        totalMemoryUsage,
-        oldestEntry,
-        newestEntry,
-        layerCount: layers.length
-      },
-      keyCollisions,
-      recommendations
+      activeDebugSession: this.activeSession ? {
+        ...this.activeSession,
+        operations: [...this.activeSession.operations],
+        filters: { ...this.activeSession.filters }
+      } : null
     };
-    frontendLogger.adapter.transformSuccess("CacheDebugger", {
-      message: "Cache state report generated",
-      reportId,
-      totalKeys,
-      totalMemoryUsage: Math.round(totalMemoryUsage / 1024),
-      layerCount: layers.length
-    });
-    return report;
   }
   startDebugSession(filters = {}) {
-    const sessionId = `debug-session-${Date.now()}`;
-    const session = {
-      sessionId,
-      startTime: Date.now(),
-      operations: [],
-      filters,
-      isActive: true
+    if (this.activeSession) {
+      this.stopDebugSession();
+    }
+    const sessionId = `debug-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    this.activeSession = {
+      id: sessionId,
+      startedAt: Date.now(),
+      filters: { ...filters },
+      operations: []
     };
-    this.debugSessions.set(sessionId, session);
-    this.activeSession = session;
-    this.setupSessionEventListeners(session);
-    frontendLogger.adapter.transformSuccess("CacheDebugger", {
-      message: `Debug session started: ${sessionId}`,
-      ...filters
-    });
+    this.unsubscribeSessionEvents = DEBUG_EVENT_NAMES.map((eventName) => this.eventBus.on(eventName, (event) => {
+      if (!this.activeSession) {
+        return;
+      }
+      const operation = this.toDebugOperation(eventName, event);
+      if (this.matchesFilters(operation, this.activeSession.filters)) {
+        this.activeSession.operations.push(operation);
+      }
+    }));
     return sessionId;
   }
   stopDebugSession() {
     if (!this.activeSession) {
       return null;
     }
-    this.activeSession.isActive = false;
-    const session = this.activeSession;
-    this.activeSession = null;
-    frontendLogger.adapter.transformSuccess("CacheDebugger", {
-      message: `Debug session stopped: ${session.sessionId}`,
-      duration: Date.now() - session.startTime,
-      operationCount: session.operations.length
-    });
-    return session;
-  }
-  setupSessionEventListeners(session) {
-    const recordOperation = (operation) => {
-      if (!session.isActive) {
-        return;
-      }
-      if (session.filters.layers && !session.filters.layers.includes(operation.layer || "")) {
-        return;
-      }
-      if (session.filters.scopeIds && !session.filters.scopeIds.includes(operation.scopeId || "")) {
-        return;
-      }
-      if (session.filters.dataTypes && !session.filters.dataTypes.includes(operation.dataType || "")) {
-        return;
-      }
-      if (session.filters.operations && !session.filters.operations.includes(operation.operation || "")) {
-        return;
-      }
-      if (session.filters.minDuration && (operation.duration || 0) < session.filters.minDuration) {
-        return;
-      }
-      const debugOp = {
-        timestamp: Date.now(),
-        layer: operation.layer || "unknown",
-        operation: operation.operation || "get",
-        key: operation.key || "unknown",
-        scopeId: operation.scopeId,
-        dataType: operation.dataType,
-        duration: operation.duration || 0,
-        success: operation.success !== false,
-        metadata: operation.metadata
-      };
-      session.operations.push(debugOp);
-      this.operationHistory.push(debugOp);
-      if (this.operationHistory.length > this.maxHistorySize) {
-        this.operationHistory = this.operationHistory.slice(-this.maxHistorySize);
-      }
+    this.unsubscribeSessionEvents.forEach((unsubscribe) => unsubscribe());
+    this.unsubscribeSessionEvents = [];
+    const completedSession = {
+      ...this.activeSession,
+      endedAt: Date.now(),
+      operations: [...this.activeSession.operations],
+      filters: { ...this.activeSession.filters }
     };
-    this.eventBus.on("cache-updated", (event) => {
-      const eventKey = typeof event.metadata?.key === "string" ? event.metadata.key : "unknown";
-      recordOperation({
-        layer: event.source,
-        operation: "set",
-        key: eventKey,
-        scopeId: event.scopeId,
-        dataType: event.dataType,
-        duration: 0
-      });
-    });
-    this.eventBus.on("cache-cleared", (event) => {
-      const eventPattern = typeof event.metadata?.pattern === "string" ? event.metadata.pattern : "bulk-clear";
-      recordOperation({
-        layer: event.source,
-        operation: "clear",
-        key: eventPattern,
-        scopeId: event.scopeId,
-        dataType: event.dataType,
-        duration: 0
-      });
-    });
+    this.activeSession = null;
+    return completedSession;
   }
   visualizeInvalidationFlow(dataType) {
-    const timestamp = Date.now();
-    const steps = [
-      {
-        step: 1,
-        layer: "CacheCoordinator",
-        operation: "invalidateData",
-        startTime: timestamp,
-        endTime: timestamp + 10,
-        duration: 10,
-        success: true,
-        keysAffected: [`${dataType}-coordinator`]
-      },
-      {
-        step: 2,
-        layer: "UnifiedCache",
-        operation: "clearByType",
-        startTime: timestamp + 10,
-        endTime: timestamp + 25,
-        duration: 15,
-        success: true,
-        keysAffected: [`${dataType}-unified-1`, `${dataType}-unified-2`]
-      },
-      {
-        step: 3,
-        layer: "TanStackQuery",
-        operation: "invalidateQueries",
-        startTime: timestamp + 25,
-        endTime: timestamp + 40,
-        duration: 15,
-        success: true,
-        keysAffected: [`${dataType}-query-1`, `${dataType}-query-2`]
-      }
-    ];
-    const diagram = {
-      trigger: `${dataType}-invalidation`,
-      scopeId: "example-scope",
-      timestamp,
-      steps,
-      duration: 40,
-      success: true,
-      errors: []
+    const recentOperations = this.cacheMonitor.generateReport(36e5).recentOperations.filter((operation) => operation.dataType === dataType).filter((operation) => operation.operation === "invalidate" || operation.operation === "clear");
+    const scopeId = recentOperations[0]?.scopeId ?? "global";
+    const steps = recentOperations.length > 0 ? recentOperations.map((operation) => ({
+      timestamp: operation.timestamp,
+      event: operation.operation,
+      description: `${operation.layer} ${operation.operation} on ${operation.key}`,
+      scopeId: operation.scopeId
+    })) : [{
+      timestamp: Date.now(),
+      event: "none",
+      description: `No invalidation activity recorded for ${dataType}`,
+      scopeId
+    }];
+    return {
+      dataType,
+      scopeId,
+      steps
     };
-    frontendLogger.adapter.transformSuccess("CacheDebugger", {
-      message: `Invalidation flow visualized for ${dataType}`,
-      stepCount: steps.length,
-      totalDuration: diagram.duration
-    });
-    return diagram;
   }
   findPerformanceBottlenecks() {
-    const slowOperations = this.operationHistory.filter((op) => op.duration > 100).sort((a, b) => b.duration - a.duration).slice(0, 10);
-    const missCount = /* @__PURE__ */ new Map();
-    this.operationHistory.filter((op) => op.operation === "get" && !op.success).forEach((op) => {
-      const count = missCount.get(op.key) || 0;
-      missCount.set(op.key, count + 1);
+    const report = this.cacheMonitor.generateReport(36e5);
+    const slowOperations = report.recentOperations.filter((operation) => operation.durationMs >= 150);
+    const missCounts = /* @__PURE__ */ new Map();
+    report.recentOperations.filter((operation) => operation.operation === "miss").forEach((operation) => {
+      missCounts.set(operation.key, (missCounts.get(operation.key) ?? 0) + 1);
     });
-    const frequentMisses = Array.from(missCount.entries()).map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count).slice(0, 10);
-    const memoryHogs = [
-      { layer: "UnifiedCache", usage: 50 * 1024 * 1024 },
-      { layer: "TanStackQuery", usage: 30 * 1024 * 1024 }
-    ];
-    const recommendations = [
-      ...slowOperations.length > 0 ? [`Found ${slowOperations.length} slow operations. Consider optimizing data access patterns.`] : [],
-      ...frequentMisses.length > 0 ? [`Found ${frequentMisses.length} frequently missed keys. Consider increasing TTL or preloading.`] : [],
-      ...memoryHogs.some((h) => h.usage > 100 * 1024 * 1024) ? ["High memory usage detected. Consider implementing cache size limits."] : []
-    ];
+    const frequentMisses = Array.from(missCounts.entries()).sort((left, right) => right[1] - left[1]).slice(0, 10).map(([key, count]) => ({ key, count }));
+    const memoryHogs = this.inspectCacheState().layers.map((layer) => ({ layer: layer.layer, usage: layer.memoryUsage })).sort((left, right) => right.usage - left.usage).slice(0, 5);
+    const recommendations = [];
+    if (report.alerts.highMissRateLayers.length > 0) {
+      recommendations.push(`Review miss-heavy layers: ${report.alerts.highMissRateLayers.join(", ")}`);
+    }
+    if (slowOperations.length > 0) {
+      recommendations.push("Reduce expensive cache population paths or increase warm-up coverage.");
+    }
+    if (memoryHogs.length > 0 && memoryHogs[0].usage > 25e4) {
+      recommendations.push(`Trim oversized cache layer ${memoryHogs[0].layer} or reduce TTLs.`);
+    }
+    if (recommendations.length === 0) {
+      recommendations.push("No obvious cache bottlenecks detected in the current sample window.");
+    }
     return {
       slowOperations,
       frequentMisses,
@@ -1689,175 +1563,109 @@ var CacheDebugger = class {
       recommendations
     };
   }
-  analyzeKeyCollisions() {
-    const collisions = [];
-    const commonKeys = ["portfolio-summary", "risk-score", "risk-analysis"];
-    commonKeys.forEach((key) => {
-      collisions.push({
-        key,
-        layers: ["UnifiedCache", "TanStackQuery"],
-        potentialConflict: false,
-        recommendation: `Key "${key}" is used across multiple layers but with proper namespacing.`
-      });
-    });
-    return collisions;
+  clearAll() {
+    this.cacheCoordinator.clearAll?.();
   }
-  clearAllCaches() {
-    try {
-      this.unifiedCache.clear();
-      this.cacheCoordinator?.clearAll?.();
-      frontendLogger.adapter.transformSuccess("CacheDebugger", "All caches cleared");
-    } catch (error) {
-      frontendLogger.adapter.transformError("CacheDebugger", error, {
-        operation: "clear-all-caches"
-      });
+  toDebugOperation(eventName, event) {
+    const metadata = event.metadata ?? {};
+    const scopeId = typeof event.scopeId === "string" ? event.scopeId : typeof event.portfolioId === "string" ? event.portfolioId : void 0;
+    return {
+      layer: typeof metadata.layer === "string" ? metadata.layer : "debug-session",
+      key: typeof metadata.key === "string" ? metadata.key : `${eventName}:${event.dataType ?? "unknown"}`,
+      operation: eventName === "cache-hit" ? "hit" : eventName === "cache-miss" ? "miss" : eventName === "cache-updated" ? "set" : eventName === "cache-cleared" ? "clear" : "invalidate",
+      durationMs: typeof metadata.durationMs === "number" ? metadata.durationMs : 0,
+      timestamp: typeof event.timestamp === "number" ? event.timestamp : Date.now(),
+      scopeId,
+      dataType: event.dataType,
+      success: true,
+      metadata
+    };
+  }
+  matchesFilters(operation, filters) {
+    if (filters.layer && operation.layer !== filters.layer) {
+      return false;
     }
-  }
-  showHelp() {
-    const help = `
-Cache Debugger Commands:
-
-State Inspection:
-  cacheDebugger.inspectState()           - Get current cache state report
-  cacheDebugger.getPerformanceReport()   - Get performance metrics
-
-Session Debugging:
-  cacheDebugger.startSession(filters)    - Start tracking cache operations
-  cacheDebugger.stopSession()            - Stop current debug session
-
-Analysis:
-  cacheDebugger.findBottlenecks()        - Find performance issues
-  cacheDebugger.analyzeKeyCollisions()   - Check for key conflicts
-  cacheDebugger.visualizeInvalidation(dataType) - Show invalidation flow
-
-Utilities:
-  cacheDebugger.clearAllCaches()         - Clear all caches (use carefully)
-  cacheDebugger.help()                   - Show this help
-
-Example filters for startSession():
-{
-  layers: ['UnifiedCache'],
-  scopeIds: ['scope-123'],
-  dataTypes: ['riskScore'],
-  operations: ['get', 'set'],
-  minDuration: 50
-}
-    `;
-    console.log(help);
-  }
-  extractCacheKeys(_layer) {
-    return [
-      {
-        key: "risk-score-scope-123",
-        dataType: "riskScore",
-        scopeId: "scope-123",
-        size: 1024,
-        age: 3e4,
-        ttl: 3e5,
-        hitCount: 5,
-        lastAccessed: Date.now() - 3e4,
-        isExpired: false
-      }
-    ];
-  }
-  extractQueryCacheKeys() {
-    return [
-      {
-        key: "riskScore-scope-123",
-        dataType: "riskScore",
-        scopeId: "scope-123",
-        size: 2048,
-        age: 6e4,
-        ttl: 3e5,
-        hitCount: 3,
-        lastAccessed: Date.now() - 6e4,
-        isExpired: false
-      }
-    ];
-  }
-  estimateMemoryUsage(keys) {
-    return keys.reduce((sum, key) => sum + key.size, 0);
-  }
-  assessLayerHealth(keys) {
-    const expiredCount = keys.filter((k) => k.isExpired).length;
-    const expiredRatio = keys.length > 0 ? expiredCount / keys.length : 0;
-    if (expiredRatio > 0.5) {
-      return "critical";
+    if (filters.scopeIds && filters.scopeIds.length > 0 && !filters.scopeIds.includes(operation.scopeId ?? "")) {
+      return false;
     }
-    if (expiredRatio > 0.2) {
-      return "warning";
+    if (filters.dataTypes && filters.dataTypes.length > 0 && !filters.dataTypes.includes(operation.dataType ?? "")) {
+      return false;
     }
-    return "healthy";
-  }
-  identifyLayerIssues(keys) {
-    const issues = [];
-    const expiredCount = keys.filter((k) => k.isExpired).length;
-    const lowHitCount = keys.filter((k) => k.hitCount < 2).length;
-    if (expiredCount > 0) {
-      issues.push(`${expiredCount} expired entries found`);
+    if (filters.operations && filters.operations.length > 0 && !filters.operations.includes(operation.operation)) {
+      return false;
     }
-    if (lowHitCount > keys.length * 0.3) {
-      issues.push(`${lowHitCount} entries with low hit count`);
+    if (filters.since && operation.timestamp < filters.since) {
+      return false;
     }
-    return issues;
-  }
-  generateRecommendations(layers, collisions) {
-    const recommendations = [];
-    layers.forEach((layer) => {
-      if (layer.health === "critical") {
-        recommendations.push(`${layer.layer}: Critical issues detected. Consider cache cleanup.`);
-      }
-      if (layer.memoryUsage > 50 * 1024 * 1024) {
-        recommendations.push(`${layer.layer}: High memory usage. Consider implementing size limits.`);
-      }
-    });
-    if (collisions.some((c) => c.potentialConflict)) {
-      recommendations.push("Key collisions detected. Review cache key naming strategy.");
-    }
-    return recommendations;
+    return true;
   }
 };
 
 // src/cache/types.ts
+var CACHE_KEY_PREFIX = "cache";
+function sortValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => sortValue(item));
+  }
+  if (value && typeof value === "object" && !(value instanceof Date)) {
+    return Object.keys(value).sort().reduce((accumulator, key) => {
+      accumulator[key] = sortValue(value[key]);
+      return accumulator;
+    }, {});
+  }
+  return value;
+}
+function deterministicStringify(value) {
+  return JSON.stringify(sortValue(value));
+}
+function generateContentHash(value) {
+  const serialized = deterministicStringify(value);
+  let hash = 0;
+  for (let index = 0; index < serialized.length; index += 1) {
+    hash = (hash << 5) - hash + serialized.charCodeAt(index);
+    hash |= 0;
+  }
+  return `${Math.abs(hash).toString(36)}${serialized.length.toString(36)}`;
+}
+function validateCacheKeyMetadata(metadata) {
+  return metadata && typeof metadata.scopeId === "string" && metadata.scopeId.length > 0 && typeof metadata.dataType === "string" && metadata.dataType.length > 0 && typeof metadata.version === "string" && metadata.version.length > 0 && typeof metadata.timestamp === "number";
+}
 function generateStandardCacheKey(baseKey, metadata) {
-  const keyParts = [
-    metadata.dataType,
-    metadata.scopeId,
-    baseKey,
-    metadata.version || "v1"
-  ].filter(Boolean);
+  const normalizedMetadata = {
+    ...metadata,
+    version: metadata.version ?? "v1",
+    timestamp: metadata.timestamp ?? Date.now()
+  };
+  if (!validateCacheKeyMetadata(normalizedMetadata)) {
+    throw new Error("Cache key metadata must include non-empty scopeId and dataType values");
+  }
+  const key = [
+    CACHE_KEY_PREFIX,
+    normalizedMetadata.version,
+    encodeURIComponent(normalizedMetadata.dataType),
+    encodeURIComponent(normalizedMetadata.scopeId),
+    encodeURIComponent(baseKey)
+  ].join("::");
   return {
-    key: keyParts.join("_"),
-    metadata: {
-      ...metadata,
-      timestamp: Date.now()
-    }
+    key,
+    metadata: normalizedMetadata
   };
 }
 function parseStandardCacheKey(key) {
-  const parts = key.split("_");
-  if (parts.length < 4) {
+  const parts = key.split("::");
+  if (parts.length !== 5 || parts[0] !== CACHE_KEY_PREFIX) {
     return null;
   }
-  return {
-    dataType: parts[0],
-    scopeId: parts[1],
-    baseKey: parts.slice(2, -1).join("_"),
-    version: parts[parts.length - 1]
-  };
-}
-function validateCacheKeyMetadata(metadata) {
-  return !!(metadata.scopeId && metadata.dataType && typeof metadata.scopeId === "string" && typeof metadata.dataType === "string");
-}
-function generateContentHash(content) {
-  const str = JSON.stringify(content);
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash &= hash;
+  try {
+    return {
+      version: parts[1],
+      dataType: decodeURIComponent(parts[2]),
+      scopeId: decodeURIComponent(parts[3]),
+      baseKey: decodeURIComponent(parts[4])
+    };
+  } catch {
+    return null;
   }
-  return Math.abs(hash).toString(36);
 }
 
 // src/services/ServiceContainer.ts
@@ -2323,6 +2131,18 @@ function cn(...inputs) {
   return tailwindMerge.twMerge(clsx.clsx(inputs));
 }
 
+// src/errors/UpgradeRequiredError.ts
+var UpgradeRequiredError = class extends Error {
+  constructor(tierRequired, tierCurrent, message) {
+    super(message ?? `This feature requires a ${tierRequired} subscription.`);
+    this.status = 403;
+    this.name = "UpgradeRequiredError";
+    this.tierRequired = tierRequired;
+    this.tierCurrent = tierCurrent;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+};
+
 // src/http/HttpClient.ts
 var HttpClient = class {
   constructor(config) {
@@ -2330,12 +2150,13 @@ var HttpClient = class {
     this.getToken = config.getToken;
     this.logger = config.logger;
     this.onUnauthorized = config.onUnauthorized;
+    this.onAuthRetry = config.onAuthRetry;
   }
   /** JSON request/response */
   async request(endpoint, options = {}) {
-    const { config, relativeStart, startTime } = this.createRequestConfig(endpoint, options);
+    const { config, relativeStart, startTime, retries } = this.createRequestConfig(endpoint, options);
     try {
-      const response = await this.fetchWithRetry(`${this.baseURL}${endpoint}`, config, 3);
+      const response = await this.fetchWithRetry(`${this.baseURL}${endpoint}`, config, retries);
       const data = await response.json();
       const duration = performance.now() - startTime;
       this.logger?.network.response(endpoint, response.status, duration, "HttpClient");
@@ -2350,9 +2171,9 @@ var HttpClient = class {
   }
   /** Raw Response for SSE streaming */
   async requestStream(endpoint, options = {}) {
-    const { config, relativeStart, startTime } = this.createRequestConfig(endpoint, options);
+    const { config, relativeStart, startTime, retries } = this.createRequestConfig(endpoint, options);
     try {
-      const response = await this.fetchWithRetry(`${this.baseURL}${endpoint}`, config, 3);
+      const response = await this.fetchWithRetry(`${this.baseURL}${endpoint}`, config, retries);
       const duration = performance.now() - startTime;
       this.logger?.network.response(endpoint, response.status, duration, "HttpClient");
       if (typeof relativeStart === "number") {
@@ -2366,6 +2187,7 @@ var HttpClient = class {
   }
   /** Retry with exponential backoff (internal) */
   async fetchWithRetry(url, options, retries) {
+    let authRetried = false;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       try {
         const response = await fetch(url, options);
@@ -2375,9 +2197,22 @@ var HttpClient = class {
         if (response.ok) {
           return response;
         }
-        if (response.status === 401 && this.onUnauthorized) {
+        if (response.status === 401) {
+          if (this.onAuthRetry && !authRetried) {
+            authRetried = true;
+            const stillValid = await this.onAuthRetry().catch(() => false);
+            if (stillValid) {
+              continue;
+            }
+          }
           this.onUnauthorized?.();
           throw this.createHttpError(response, "Session expired");
+        }
+        if (response.status === 403) {
+          const upgradeRequiredError = await this.createUpgradeRequiredError(response);
+          if (upgradeRequiredError) {
+            throw upgradeRequiredError;
+          }
         }
         throw this.createHttpError(response);
       } catch (error) {
@@ -2387,7 +2222,7 @@ var HttpClient = class {
         if (this.isRetryableHttpError(error) && error.status === 429) {
           throw error;
         }
-        if (this.isRetryableHttpError(error) && error.status === 401 && this.onUnauthorized) {
+        if (this.isRetryableHttpError(error) && (error.status === 401 || error.status === 403)) {
           throw error;
         }
         if (attempt === retries) {
@@ -2399,8 +2234,9 @@ var HttpClient = class {
     throw new Error("Max retries exceeded");
   }
   createRequestConfig(endpoint, options) {
+    const { retry, ...requestOptions } = options;
     const controller = new AbortController();
-    const externalSignal = options.signal;
+    const externalSignal = requestOptions.signal;
     if (externalSignal) {
       if (externalSignal.aborted) {
         controller.abort(externalSignal.reason);
@@ -2410,14 +2246,14 @@ var HttpClient = class {
         });
       }
     }
-    const isFormDataBody = typeof FormData !== "undefined" && options.body instanceof FormData;
+    const isFormDataBody = typeof FormData !== "undefined" && requestOptions.body instanceof FormData;
     const headers = new Headers({
       "X-Requested-With": "XMLHttpRequest"
     });
     if (!isFormDataBody) {
       headers.set("Content-Type", "application/json");
     }
-    new Headers(options.headers).forEach((value, key) => {
+    new Headers(requestOptions.headers).forEach((value, key) => {
       if (isFormDataBody && key.toLowerCase() === "content-type") {
         return;
       }
@@ -2427,17 +2263,18 @@ var HttpClient = class {
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
-    const method = options.method ?? "GET";
+    const method = requestOptions.method ?? "GET";
     const startTime = performance.now();
     const relativeStart = typeof this.logger?.getNavigationElapsed === "function" ? this.logger.getNavigationElapsed() : void 0;
-    this.logger?.network.request(endpoint, method, options.body, "HttpClient");
+    this.logger?.network.request(endpoint, method, requestOptions.body, "HttpClient");
     return {
       config: {
-        ...options,
+        ...requestOptions,
         signal: controller.signal,
         credentials: "include",
         headers
       },
+      retries: retry === false ? 0 : typeof retry === "number" ? Math.max(0, retry) : 3,
       relativeStart,
       startTime
     };
@@ -2455,6 +2292,16 @@ var HttpClient = class {
       }
     }
     return error;
+  }
+  async createUpgradeRequiredError(response) {
+    const body = await response.clone().json().catch(() => null);
+    if (body?.detail?.error !== "upgrade_required") {
+      return null;
+    }
+    const tierRequired = typeof body.detail.tier_required === "string" ? body.detail.tier_required : "paid";
+    const tierCurrent = typeof body.detail.tier_current === "string" ? body.detail.tier_current : "registered";
+    const message = typeof body.detail.message === "string" ? body.detail.message : void 0;
+    return new UpgradeRequiredError(tierRequired, tierCurrent, message);
   }
   isRetryableHttpError(error) {
     return typeof error === "object" && error !== null && "status" in error;
@@ -2562,6 +2409,7 @@ function createAuthStore(config) {
   let storageHandler = null;
   let broadcastCleanup = null;
   let isListenerSetup = false;
+  let initializePromise = null;
   return traditional.createWithEqualityFn()(
     middleware.devtools((set, get) => ({
       // Initial state
@@ -2611,31 +2459,37 @@ function createAuthStore(config) {
       initializeAuth: async () => {
         const state = get();
         if (state.isInitialized) return;
-        set({ isLoading: true, error: null });
-        try {
-          const AUTH_TIMEOUT_MS = 35e3;
-          const timeoutPromise = new Promise(
-            (_, reject) => setTimeout(() => reject(new Error("Auth check timed out")), AUTH_TIMEOUT_MS)
-          );
-          const response = await Promise.race([config.checkAuthStatus(), timeoutPromise]);
-          if (response.authenticated && response.user) {
-            const user = config.mapUser(response.user);
-            config.onSignIn?.(user);
-            set({ user, isAuthenticated: true, isInitialized: true, isLoading: false, error: null });
-          } else {
-            config.onUnauthInit?.();
-            set({ user: null, isAuthenticated: false, isInitialized: true, isLoading: false, error: null });
+        if (initializePromise) return initializePromise;
+        initializePromise = (async () => {
+          set({ isLoading: true, error: null });
+          try {
+            const AUTH_TIMEOUT_MS = 35e3;
+            const timeoutPromise = new Promise(
+              (_, reject) => setTimeout(() => reject(new Error("Auth check timed out")), AUTH_TIMEOUT_MS)
+            );
+            const response = await Promise.race([config.checkAuthStatus(), timeoutPromise]);
+            if (response.authenticated && response.user) {
+              const user = config.mapUser(response.user);
+              config.onSignIn?.(user);
+              set({ user, isAuthenticated: true, isInitialized: true, isLoading: false, error: null });
+            } else {
+              config.onUnauthInit?.();
+              set({ user: null, isAuthenticated: false, isInitialized: true, isLoading: false, error: null });
+            }
+          } catch (error) {
+            config.logger?.logError?.("authStore", "Auth initialization failed", error);
+            set({
+              user: null,
+              isAuthenticated: false,
+              isInitialized: true,
+              isLoading: false,
+              error: error instanceof Error ? error.message : "Authentication check failed"
+            });
+          } finally {
+            initializePromise = null;
           }
-        } catch (error) {
-          config.logger?.logError?.("authStore", "Auth initialization failed", error);
-          set({
-            user: null,
-            isAuthenticated: false,
-            isInitialized: true,
-            isLoading: false,
-            error: error instanceof Error ? error.message : "Authentication check failed"
-          });
-        }
+        })();
+        return initializePromise;
       },
       setupCrossTabSync: () => {
         if (typeof window === "undefined" || isListenerSetup) return;
@@ -2757,6 +2611,7 @@ exports.LogoutBroadcaster = LogoutBroadcaster;
 exports.QueryProvider = QueryProvider;
 exports.ServiceContainer = ServiceContainer;
 exports.UnifiedCache = UnifiedCache;
+exports.UpgradeRequiredError = UpgradeRequiredError;
 exports._clearResetFunction = _clearResetFunction;
 exports._setResetFunction = _setResetFunction;
 exports.broadcastLogout = broadcastLogout;

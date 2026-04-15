@@ -26,6 +26,7 @@ declare class FrontendLogger {
     private sessionLifecycleStarted;
     private currentUserId;
     private sessionStartTime;
+    private _initTimestamp;
     private readonly SESSION_SUMMARY_INTERVAL_MS;
     private readonly QUEUE_FLUSH_DEBOUNCE_MS;
     private _routeTimings;
@@ -261,262 +262,229 @@ declare class EventBus {
     getListenersByEvent(): Record<string, number>;
 }
 
-interface CacheEntry<T = unknown> {
-    value: T;
-    timestamp: number;
-    ttl: number;
+interface CacheEntryMetadata {
     scopeId?: string;
     dataType?: string;
+    version?: string;
+    userId?: string;
+    timestamp?: number;
+    tags?: string[];
+    [key: string]: unknown;
 }
-interface CacheStats {
-    totalEntries: number;
-    hitCount: number;
-    missCount: number;
-    hitRatio: number;
-    entriesByType: Record<string, number>;
-    entriesByScope: Record<string, number>;
-}
-interface CachePerformanceMetrics {
-    hitRatio: number;
-    avgResponseTime: number;
-    totalRequests: number;
-    errorRate: number;
-    entriesByType: Record<string, {
-        hits: number;
-        misses: number;
-        errors: number;
-    }>;
-    recentOperations: Array<{
-        timestamp: number;
-        operation: 'hit' | 'miss' | 'clear' | 'error';
-        key: string;
-        responseTime?: number;
-        dataType?: string;
-    }>;
-}
-declare class UnifiedCache {
-    private eventBus;
-    private cache;
-    private performanceMetrics;
-    constructor(eventBus: EventBus);
-    get<T>(key: string, factory: () => T, ttl: number, metadata?: {
-        scopeId?: string;
-        dataType?: string;
-    }): T;
-    set<T>(key: string, value: T, ttl: number, metadata?: {
-        scopeId?: string;
-        dataType?: string;
-    }): void;
-    delete(key: string): boolean;
-    clearByType(dataType: string, scopeId?: string): number;
-    clearByPattern(pattern: RegExp): number;
-    clearScope(scopeId: string): number;
-    clear(): void;
-    has(key: string): boolean;
-    inspect(key: string): CacheEntry | null;
-    getKeys(): string[];
-    private recordOperation;
-    getStats(): CacheStats;
-    getPerformanceMetrics(): CachePerformanceMetrics;
-}
-
-interface CacheMetrics {
+interface CacheOperationMetrics {
+    key: string;
     layer: string;
     operation: 'hit' | 'miss' | 'set' | 'clear' | 'invalidate';
-    key: string;
-    responseTime: number;
-    dataType?: string;
-    scopeId?: string;
+    durationMs: number;
     timestamp: number;
-    cacheSize?: number;
-    memoryUsage?: number;
+    scopeId?: string;
+    dataType?: string;
+    success: boolean;
+    metadata?: Record<string, unknown>;
 }
-interface LayerPerformance {
-    layer: string;
+interface StandardCacheKey<TMetadata extends CacheEntryMetadata = CacheEntryMetadata> {
+    key: string;
+    metadata: TMetadata;
+}
+interface ValidatedCacheKeyMetadata extends CacheEntryMetadata {
+    scopeId: string;
+    dataType: string;
+    version: string;
+    timestamp: number;
+}
+declare function generateContentHash(value: unknown): string;
+declare function validateCacheKeyMetadata(metadata: CacheEntryMetadata): metadata is ValidatedCacheKeyMetadata;
+declare function generateStandardCacheKey(baseKey: string, metadata: CacheEntryMetadata): StandardCacheKey<ValidatedCacheKeyMetadata>;
+declare function parseStandardCacheKey(key: string): {
+    version: string;
+    dataType: string;
+    scopeId: string;
+    baseKey: string;
+} | null;
+
+interface CacheEntry<T = unknown> extends CacheEntryMetadata {
+    key: string;
+    value: T;
+    ttl: number;
+    createdAt: number;
+    updatedAt: number;
+    expiresAt: number;
+    lastAccessedAt: number;
+    hitCount: number;
+    size: number;
+}
+interface CacheStats {
+    entries: number;
+    hits: number;
+    misses: number;
+    hitRate: number;
+    entriesByType: Record<string, number>;
+    entriesByScope: Record<string, number>;
+    expiredEntries: number;
+    memoryUsage: number;
+    totalOperations: number;
+}
+interface CachePerformanceMetrics {
     totalOperations: number;
     hits: number;
     misses: number;
-    hitRatio: number;
-    avgResponseTime: number;
-    totalResponseTime: number;
-    cacheSize: number;
-    memoryUsage: number;
-    lastActivity: number;
+    writes: number;
+    hitRate: number;
+    averageHitTimeMs: number;
+    averageMissTimeMs: number;
+    recentOperations: CacheOperationMetrics[];
 }
-interface CachePerformanceReport {
-    reportId: string;
-    generatedAt: number;
-    timeRange: {
-        start: number;
-        end: number;
-        durationMs: number;
-    };
-    layers: LayerPerformance[];
-    summary: {
-        totalOperations: number;
-        overallHitRatio: number;
-        avgResponseTime: number;
-        totalMemoryUsage: number;
-        mostActiveLayer: string;
-        slowestLayer: string;
-        recommendations: string[];
-    };
-    recentOperations: CacheMetrics[];
+declare class UnifiedCache {
+    private readonly eventBus;
+    private readonly entries;
+    private readonly recentOperations;
+    private readonly maxTrackedOperations;
+    private hitCount;
+    private missCount;
+    constructor(eventBus: EventBus);
+    get<T>(key: string, factory: () => T, ttl: number, metadata?: CacheEntryMetadata): T;
+    set<T>(key: string, value: T, ttl: number, metadata?: CacheEntryMetadata): void;
+    clearByType(dataType: string, scopeId?: string): number;
+    clearScope(scopeId: string): number;
+    clear(): void;
+    clearByPattern(pattern: RegExp): number;
+    inspect<T = unknown>(key: string): CacheEntry<T> | null;
+    listEntries<T = unknown>(): CacheEntry<T>[];
+    getStats(): CacheStats;
+    getPerformanceMetrics(windowMs?: number): CachePerformanceMetrics;
+    getRecentOperations(limit?: number): CacheOperationMetrics[];
+    private buildEntry;
+    private clearMatchingEntries;
+    private pruneExpiredEntries;
+    private isExpired;
+    private recordOperation;
+    private emitEvent;
+}
+
+type CacheMetrics = CacheOperationMetrics;
+interface LayerPerformance {
+    layer: string;
+    operations: number;
+    hits: number;
+    misses: number;
+    hitRate: number;
+    averageResponseTime: number;
+    slowOperations: number;
 }
 interface CacheAlerts {
-    lowHitRatio: {
-        layer: string;
-        ratio: number;
-        threshold: number;
-    }[];
-    slowOperations: {
-        layer: string;
-        avgTime: number;
-        threshold: number;
-    }[];
-    highMemoryUsage: {
-        layer: string;
-        usage: number;
-        threshold: number;
-    }[];
-    frequentMisses: {
-        key: string;
-        count: number;
-        layer: string;
-    }[];
+    slowLayers: string[];
+    hotKeys: string[];
+    highMissRateLayers: string[];
+}
+interface CachePerformanceReport {
+    generatedAt: number;
+    timeRangeMs: number;
+    totalOperations: number;
+    hitRate: number;
+    layers: LayerPerformance[];
+    recentOperations: CacheMetrics[];
+    alerts: CacheAlerts;
+}
+interface CacheMonitorConfig {
+    eventNames?: string[];
+    maxRecentOperations?: number;
+    slowOperationThresholdMs?: number;
+    hotKeyThreshold?: number;
+    highMissRateThreshold?: number;
 }
 declare class CacheMonitorBase {
-    private eventBus;
-    private config;
-    private metrics;
-    private layerStats;
-    private readonly maxMetricsHistory;
-    private readonly alertThresholds;
-    constructor(eventBus: EventBus, config: {
-        eventNames: string[];
-    });
-    private setupEventListeners;
+    private readonly eventBus;
+    private readonly recentOperations;
+    private readonly unsubscribers;
+    private readonly config;
+    constructor(eventBus: EventBus, config?: CacheMonitorConfig);
     trackCacheHit(layer: string, key: string, responseTime: number, dataType?: string, scopeId?: string): void;
     trackCacheMiss(layer: string, key: string, fetchTime: number, dataType?: string, scopeId?: string): void;
-    private trackCacheOperation;
-    private updateLayerStats;
     generateReport(timeRangeMs?: number): CachePerformanceReport;
-    private generateRecommendations;
-    getAlerts(): CacheAlerts;
-    private getFrequentMisses;
-    getRealtimeStats(): {
-        layers: LayerPerformance[];
-        alerts: CacheAlerts;
-    };
-    clearMetrics(): void;
     getLayerMetrics(layer: string): CacheMetrics[];
     getScopeMetrics(scopeId: string): CacheMetrics[];
+    getRecentOperations(limit?: number): CacheMetrics[];
+    dispose(): void;
+    private subscribeToEvents;
+    private metricFromEvent;
+    private resolveLayer;
+    private resolveOperation;
+    private recordMetric;
+    private buildLayerPerformance;
+    private buildAlerts;
 }
 
 interface CacheCoordinatorLike {
     clearAll?: () => void;
 }
-interface CacheStateReport {
-    reportId: string;
-    timestamp: number;
-    layers: LayerState[];
-    summary: {
-        totalKeys: number;
-        totalMemoryUsage: number;
-        oldestEntry: number;
-        newestEntry: number;
-        layerCount: number;
-    };
-    keyCollisions: KeyCollision[];
-    recommendations: string[];
-}
-interface LayerState {
-    layer: string;
-    keyCount: number;
-    memoryUsage: number;
-    oldestEntry: number;
-    newestEntry: number;
-    keys: CacheKeyInfo[];
-    health: 'healthy' | 'warning' | 'critical';
-    issues: string[];
-}
 interface CacheKeyInfo {
     key: string;
     dataType?: string;
     scopeId?: string;
-    size: number;
-    age: number;
     ttl: number;
+    expiresAt: number;
+    ageMs: number;
+    remainingTtlMs: number | null;
     hitCount: number;
-    lastAccessed: number;
+    size: number;
     isExpired: boolean;
 }
-interface KeyCollision {
-    key: string;
-    layers: string[];
-    potentialConflict: boolean;
-    recommendation: string;
+interface LayerState {
+    layer: string;
+    entryCount: number;
+    memoryUsage: number;
+    keys: CacheKeyInfo[];
 }
-interface InvalidationFlowDiagram {
-    trigger: string;
-    scopeId: string;
-    timestamp: number;
-    steps: InvalidationStep[];
-    duration: number;
-    success: boolean;
-    errors: string[];
+interface CacheStateReport {
+    generatedAt: number;
+    totalEntries: number;
+    totalMemoryUsage: number;
+    stats: CacheStats;
+    layers: LayerState[];
+    activeDebugSession: DebugSession | null;
+}
+interface KeyCollision {
+    normalizedKey: string;
+    keys: string[];
+    count: number;
 }
 interface InvalidationStep {
-    step: number;
-    layer: string;
-    operation: string;
-    startTime: number;
-    endTime: number;
-    duration: number;
-    success: boolean;
-    keysAffected: string[];
-    error?: string;
-}
-interface DebugSession {
-    sessionId: string;
-    startTime: number;
-    operations: DebugOperation[];
-    filters: DebugFilters;
-    isActive: boolean;
-}
-interface DebugOperation {
     timestamp: number;
-    layer: string;
-    operation: 'get' | 'set' | 'clear' | 'invalidate';
-    key: string;
+    event: string;
+    description: string;
     scopeId?: string;
-    dataType?: string;
-    duration: number;
-    success: boolean;
-    metadata?: Record<string, unknown>;
 }
+interface InvalidationFlowDiagram {
+    dataType: string;
+    scopeId: string;
+    steps: InvalidationStep[];
+}
+type DebugOperation = CacheMetrics;
 interface DebugFilters {
-    layers?: string[];
+    layer?: string;
     scopeIds?: string[];
     dataTypes?: string[];
-    operations?: string[];
-    minDuration?: number;
+    operations?: Array<DebugOperation['operation']>;
+    since?: number;
+}
+interface DebugSession {
+    id: string;
+    startedAt: number;
+    endedAt?: number;
+    filters: DebugFilters;
+    operations: DebugOperation[];
 }
 declare class CacheDebugger {
-    private eventBus;
-    private unifiedCache;
-    private cacheMonitor;
-    private cacheCoordinator?;
-    private debugSessions;
+    private readonly eventBus;
+    private readonly unifiedCache;
+    private readonly cacheMonitor;
+    private readonly cacheCoordinator;
     private activeSession;
-    private operationHistory;
-    private readonly maxHistorySize;
-    constructor(eventBus: EventBus, unifiedCache: UnifiedCache, cacheMonitor: CacheMonitorBase, cacheCoordinator?: CacheCoordinatorLike | undefined);
-    private setupGlobalDebugging;
+    private unsubscribeSessionEvents;
+    constructor(eventBus: EventBus, unifiedCache: UnifiedCache, cacheMonitor: CacheMonitorBase, cacheCoordinator: CacheCoordinatorLike);
     inspectCacheState(): CacheStateReport;
     startDebugSession(filters?: DebugFilters): string;
     stopDebugSession(): DebugSession | null;
-    private setupSessionEventListeners;
     visualizeInvalidationFlow(dataType: string): InvalidationFlowDiagram;
     findPerformanceBottlenecks(): {
         slowOperations: DebugOperation[];
@@ -530,55 +498,9 @@ declare class CacheDebugger {
         }[];
         recommendations: string[];
     };
-    analyzeKeyCollisions(): KeyCollision[];
-    clearAllCaches(): void;
-    private showHelp;
-    private extractCacheKeys;
-    private extractQueryCacheKeys;
-    private estimateMemoryUsage;
-    private assessLayerHealth;
-    private identifyLayerIssues;
-    private generateRecommendations;
-}
-
-interface CacheKeyMetadata {
-    scopeId: string;
-    dataType: string;
-    version?: string;
-    userId?: string;
-    timestamp?: number;
-}
-interface StandardCacheKey {
-    key: string;
-    metadata: CacheKeyMetadata;
-}
-declare function generateStandardCacheKey(baseKey: string, metadata: CacheKeyMetadata): StandardCacheKey;
-declare function parseStandardCacheKey(key: string): {
-    dataType: string;
-    scopeId: string;
-    baseKey: string;
-    version: string;
-} | null;
-declare function validateCacheKeyMetadata(metadata: CacheKeyMetadata): boolean;
-declare function generateContentHash(content: unknown): string;
-interface CacheEntryMetadata {
-    key: string;
-    scopeId?: string;
-    dataType?: string;
-    createdAt: number;
-    expiresAt: number;
-    accessCount: number;
-    lastAccessed: number;
-}
-interface CacheOperationMetrics {
-    operation: 'hit' | 'miss' | 'set' | 'clear' | 'expire';
-    key: string;
-    dataType?: string;
-    scopeId?: string;
-    responseTime: number;
-    timestamp: number;
-    success: boolean;
-    error?: string;
+    clearAll(): void;
+    private toDebugOperation;
+    private matchesFilters;
 }
 
 declare class ServiceContainer {
@@ -657,29 +579,42 @@ type RetryableHttpError = Error & {
     status?: number;
     retryAfter?: number;
 };
+interface HttpRequestOptions extends RequestInit {
+    retry?: boolean | number;
+}
 interface HttpClientConfig {
     baseURL: string;
     getToken?: () => string | null;
     logger?: FrontendLogger;
     onUnauthorized?: () => void;
+    onAuthRetry?: () => Promise<boolean>;
 }
 declare class HttpClient {
     private readonly baseURL;
     private readonly getToken?;
     private readonly logger?;
     private readonly onUnauthorized?;
+    private readonly onAuthRetry?;
     constructor(config: HttpClientConfig);
     /** JSON request/response */
-    request<T>(endpoint: string, options?: RequestInit): Promise<T>;
+    request<T>(endpoint: string, options?: HttpRequestOptions): Promise<T>;
     /** Raw Response for SSE streaming */
-    requestStream(endpoint: string, options?: RequestInit): Promise<Response>;
+    requestStream(endpoint: string, options?: HttpRequestOptions): Promise<Response>;
     /** Retry with exponential backoff (internal) */
     private fetchWithRetry;
     private createRequestConfig;
     private createHttpError;
+    private createUpgradeRequiredError;
     private isRetryableHttpError;
     private isAbortError;
     private normalizeError;
+}
+
+declare class UpgradeRequiredError extends Error {
+    readonly tierRequired: string;
+    readonly tierCurrent: string;
+    readonly status = 403;
+    constructor(tierRequired: string, tierCurrent: string, message?: string);
 }
 
 interface QueryProviderProps {
@@ -790,4 +725,4 @@ declare function createRuntimeConfigLoader<T>(options: RuntimeConfigLoaderOption
     clearConfigCache: () => void;
 };
 
-export { AdapterRegistry, type AuthState, type AuthStoreConfig, type AuthStoreHook, type CacheAlerts, type CacheCoordinatorLike, CacheDebugger, type CacheEntry, type CacheEntryMetadata, type CacheEvent, type CacheKeyInfo, type CacheKeyMetadata, type CacheMetrics, CacheMonitorBase, type CacheOperationMetrics, type CachePerformanceMetrics, type CachePerformanceReport, type CacheStateReport, type CacheStats, type DebugFilters, type DebugOperation, type DebugSession, ErrorAdapter, type ErrorEnvelope, EventBus, type EventHandler, FrontendLogger, HttpClient, type InvalidationFlowDiagram, type InvalidationStep, type KeyCollision, type LayerPerformance, type LayerState, type LogCategory, type LogLevel, LogoutBroadcaster, QueryProvider, type RetryableHttpError, ServiceContainer, type StandardCacheKey, UnifiedCache, _clearResetFunction, _setResetFunction, broadcastLogout, cn, createAuthProvider, createAuthSelectors, createAuthStore, createRuntimeConfigLoader, frontendLogger as default, formatBasisPoints, formatCompact, formatCurrency, formatNumber, formatPercent, formatSharpeRatio, frontendLogger, generateContentHash, generateStandardCacheKey, getQueryClient, initQueryConfig, log, logoutBroadcaster, parseStandardCacheKey, queryClient, resetQueryClient, roundTo, validateCacheKeyMetadata };
+export { AdapterRegistry, type AuthState, type AuthStoreConfig, type AuthStoreHook, type CacheAlerts, type CacheCoordinatorLike, CacheDebugger, type CacheEntry, type CacheEntryMetadata, type CacheEvent, type CacheKeyInfo, type CacheMetrics, CacheMonitorBase, type CacheOperationMetrics, type CachePerformanceMetrics, type CachePerformanceReport, type CacheStateReport, type CacheStats, type DebugFilters, type DebugOperation, type DebugSession, ErrorAdapter, type ErrorEnvelope, EventBus, type EventHandler, FrontendLogger, HttpClient, type HttpRequestOptions, type InvalidationFlowDiagram, type InvalidationStep, type KeyCollision, type LayerPerformance, type LayerState, type LogCategory, type LogLevel, LogoutBroadcaster, QueryProvider, type RetryableHttpError, ServiceContainer, type StandardCacheKey, UnifiedCache, UpgradeRequiredError, type ValidatedCacheKeyMetadata, _clearResetFunction, _setResetFunction, broadcastLogout, cn, createAuthProvider, createAuthSelectors, createAuthStore, createRuntimeConfigLoader, frontendLogger as default, formatBasisPoints, formatCompact, formatCurrency, formatNumber, formatPercent, formatSharpeRatio, frontendLogger, generateContentHash, generateStandardCacheKey, getQueryClient, initQueryConfig, log, logoutBroadcaster, parseStandardCacheKey, queryClient, resetQueryClient, roundTo, validateCacheKeyMetadata };
